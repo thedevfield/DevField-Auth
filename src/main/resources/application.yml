@@ -1,0 +1,24 @@
+server:
+  address: 127.0.0.1
+  port: ${AUTH_PORT:18080}
+
+spring:
+  application:
+    name: devfield-auth
+  datasource:
+    url: ${AUTH_DB_URL:jdbc:postgresql://127.0.0.1:15432/devfield_dev?currentSchema=auth}
+    username: ${AUTH_DB_USER:devfield_auth}
+    password: ${AUTH_DB_PASSWORD}
+  flyway:
+    enabled: true
+    default-schema: auth
+    schemas: auth
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
