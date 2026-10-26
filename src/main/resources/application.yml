@@ -13,8 +13,33 @@ spring:
     enabled: true
     default-schema: auth
     schemas: auth
+  mail:
+    host: ${AUTH_SMTP_HOST}
+    port: ${AUTH_SMTP_PORT:1025}
+
+devfield:
+  auth:
+    issuer: ${AUTH_ISSUER}
+    audience: ${AUTH_AUDIENCE}
+    jwt-ttl: ${AUTH_JWT_TTL:PT5M}
+    session-ttl: ${AUTH_SESSION_TTL:P1D}
+    verification-ttl: ${AUTH_VERIFICATION_TTL:PT30M}
+    signup-cooldown: ${AUTH_SIGNUP_COOLDOWN:PT1M}
+    max-attempts: ${AUTH_MAX_ATTEMPTS:5}
+    attempt-window: ${AUTH_ATTEMPT_WINDOW:PT15M}
+    private-key-path: ${AUTH_PRIVATE_KEY_PATH}
+    public-key-path: ${AUTH_PUBLIC_KEY_PATH}
+    web-verify-url: ${AUTH_WEB_VERIFY_URL}
+    mail-from: ${AUTH_MAIL_FROM}
+    service-keys:
+      bff: ${AUTH_BFF_KEY_SHA256}
+      project: ${AUTH_PROJECT_KEY_SHA256}
+      interview: ${AUTH_INTERVIEW_KEY_SHA256}
 
 management:
+  health:
+    mail:
+      enabled: false
   endpoints:
     web:
       exposure:

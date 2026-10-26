@@ -9,3 +9,4 @@ build/
 *.key
 *.p12
 logs/
+.local/
