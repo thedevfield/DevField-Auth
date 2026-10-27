@@ -35,6 +35,11 @@ devfield:
       bff: ${AUTH_BFF_KEY_SHA256}
       project: ${AUTH_PROJECT_KEY_SHA256}
       interview: ${AUTH_INTERVIEW_KEY_SHA256}
+    oauth:
+      browser-origin: ${AUTH_BROWSER_ORIGIN:http://127.0.0.1:18080}
+      web-callback: ${AUTH_WEB_OAUTH_CALLBACK:http://localhost:13000/auth/oauth/callback}
+      intent-ttl: ${AUTH_OAUTH_INTENT_TTL:PT5M}
+      handoff-ttl: ${AUTH_OAUTH_HANDOFF_TTL:PT2M}
 
 management:
   health:

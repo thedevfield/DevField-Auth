@@ -18,8 +18,13 @@ import com.nimbusds.jose.jwk.RSAKey;
 import com.nimbusds.jwt.JWTClaimsSet;
 import com.nimbusds.jwt.SignedJWT;
 import dev.devfield.auth.mail.VerificationMailer;
+import dev.devfield.auth.oauth.OAuthFlowStore;
+import dev.devfield.auth.oauth.OAuthProviders;
 import dev.devfield.auth.util.Secrets;
+import java.io.IOException;
 import java.net.URI;
+import java.net.InetSocketAddress;
+import java.net.URLDecoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -28,6 +33,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
+import java.security.interfaces.RSAPublicKey;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.time.Instant;
@@ -42,6 +48,10 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Import;
+import org.springframework.context.annotation.Primary;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.dao.DataAccessException;
 import org.springframework.mail.MailSendException;
@@ -50,8 +60,13 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.PostgreSQLContainer;
+import com.sun.net.httpserver.HttpServer;
+import org.springframework.security.oauth2.client.registration.ClientRegistration;
+import org.springframework.security.oauth2.core.AuthorizationGrantType;
+import org.springframework.security.oauth2.core.ClientAuthenticationMethod;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@Import(AuthIntegrationTest.MockProviderConfiguration.class)
 class AuthIntegrationTest {
     private static final PostgreSQLContainer<?> PG = new PostgreSQLContainer<>("postgres:17.6-alpine")
             .withDatabaseName("auth_test").withUsername("devfield_auth").withPassword("isolated-test-only-password");
@@ -61,6 +76,8 @@ class AuthIntegrationTest {
     private static final String BFF = "test-bff-credential-with-sufficient-entropy-00001";
     private static final String PROJECT = "test-project-credential-with-sufficient-entropy-00002";
     private static final String INTERVIEW = "test-interview-credential-with-sufficient-entropy-00003";
+    private static final HttpServer MOCK_PROVIDER;
+    private static final AtomicReference<String> GOOGLE_NONCE = new AtomicReference<>();
     static {
         try {
             PG.start();
@@ -73,7 +90,93 @@ class AuthIntegrationTest {
             Files.writeString(PRIVATE, pem("PRIVATE KEY", KEY.getPrivate().getEncoded()));
             Files.writeString(PUBLIC, pem("PUBLIC KEY", KEY.getPublic().getEncoded()));
             PRIVATE.toFile().deleteOnExit(); PUBLIC.toFile().deleteOnExit(); dir.toFile().deleteOnExit();
+            MOCK_PROVIDER = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            MOCK_PROVIDER.createContext("/token", exchange -> {
+                String idToken = "";
+                if (GOOGLE_NONCE.get() != null) {
+                    try {
+                        var claims = new JWTClaimsSet.Builder()
+                                .issuer("http://127.0.0.1:" + MOCK_PROVIDER.getAddress().getPort())
+                                .audience("mock-google-client").subject("google-sub-654321")
+                                .issueTime(Date.from(Instant.now())).expirationTime(Date.from(Instant.now().plusSeconds(300)))
+                                .claim("nonce", GOOGLE_NONCE.get()).build();
+                        var signed = new SignedJWT(new JWSHeader.Builder(JWSAlgorithm.RS256).keyID("mock-google-key").build(), claims);
+                        signed.sign(new RSASSASigner(KEY.getPrivate()));
+                        idToken = ",\"id_token\":\"" + signed.serialize() + "\"";
+                    } catch (Exception e) { throw new IOException(e); }
+                }
+                byte[] body = ("{\"access_token\":\"mock-access-token\",\"token_type\":\"Bearer\",\"expires_in\":300" + idToken + "}")
+                        .getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, body.length);
+                try (var output = exchange.getResponseBody()) { output.write(body); }
+            });
+            MOCK_PROVIDER.createContext("/user", exchange -> {
+                byte[] body = "{\"id\":654321,\"login\":\"mock-account\"}".getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, body.length);
+                try (var output = exchange.getResponseBody()) { output.write(body); }
+            });
+            MOCK_PROVIDER.createContext("/userinfo", exchange -> {
+                byte[] body = "{\"sub\":\"google-sub-654321\"}".getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, body.length);
+                try (var output = exchange.getResponseBody()) { output.write(body); }
+            });
+            MOCK_PROVIDER.createContext("/jwks", exchange -> {
+                String jwks = new JWKSet(new RSAKey.Builder((RSAPublicKey) KEY.getPublic())
+                        .keyID("mock-google-key").build()).toPublicJWKSet().toString();
+                byte[] body = jwks.getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, body.length);
+                try (var output = exchange.getResponseBody()) { output.write(body); }
+            });
+            MOCK_PROVIDER.start();
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> MOCK_PROVIDER.stop(0)));
         } catch (Exception e) { throw new ExceptionInInitializerError(e); }
+    }
+
+    @TestConfiguration
+    static class MockProviderConfiguration {
+        @Bean @Primary OAuthProviders mockProviders() {
+            return new OAuthProviders("", "", "", "", "", "", "http://127.0.0.1:18080") {
+                private final ClientRegistration google = ClientRegistration.withRegistrationId("google")
+                        .clientId("mock-google-client").clientSecret("mock-google-secret")
+                        .clientAuthenticationMethod(ClientAuthenticationMethod.CLIENT_SECRET_BASIC)
+                        .authorizationGrantType(AuthorizationGrantType.AUTHORIZATION_CODE)
+                        .redirectUri("http://127.0.0.1:18080/login/oauth2/code/google").scope("openid")
+                        .authorizationUri("http://127.0.0.1:" + MOCK_PROVIDER.getAddress().getPort() + "/authorize")
+                        .tokenUri("http://127.0.0.1:" + MOCK_PROVIDER.getAddress().getPort() + "/token")
+                        .jwkSetUri("http://127.0.0.1:" + MOCK_PROVIDER.getAddress().getPort() + "/jwks")
+                        .issuerUri("http://127.0.0.1:" + MOCK_PROVIDER.getAddress().getPort())
+                        .userInfoUri("http://127.0.0.1:" + MOCK_PROVIDER.getAddress().getPort() + "/userinfo")
+                        .userNameAttributeName("sub").clientName("Mock Google").build();
+                private final ClientRegistration github = ClientRegistration.withRegistrationId("github")
+                        .clientId("mock-client").clientSecret("mock-secret")
+                        .clientAuthenticationMethod(ClientAuthenticationMethod.CLIENT_SECRET_POST)
+                        .authorizationGrantType(AuthorizationGrantType.AUTHORIZATION_CODE)
+                        .redirectUri("http://127.0.0.1:18080/login/oauth2/code/github")
+                        .authorizationUri("http://127.0.0.1:" + MOCK_PROVIDER.getAddress().getPort() + "/authorize")
+                        .tokenUri("http://127.0.0.1:" + MOCK_PROVIDER.getAddress().getPort() + "/token")
+                        .userInfoUri("http://127.0.0.1:" + MOCK_PROVIDER.getAddress().getPort() + "/user")
+                        .userNameAttributeName("id").clientName("Mock GitHub").build();
+                private final ClientRegistration kakao = ClientRegistration.withRegistrationId("kakao")
+                        .clientId("mock-kakao-client").clientSecret("mock-kakao-secret")
+                        .clientAuthenticationMethod(ClientAuthenticationMethod.CLIENT_SECRET_POST)
+                        .authorizationGrantType(AuthorizationGrantType.AUTHORIZATION_CODE)
+                        .redirectUri("http://127.0.0.1:18080/login/oauth2/code/kakao")
+                        .authorizationUri("http://127.0.0.1:" + MOCK_PROVIDER.getAddress().getPort() + "/authorize")
+                        .tokenUri("http://127.0.0.1:" + MOCK_PROVIDER.getAddress().getPort() + "/token")
+                        .userInfoUri("http://127.0.0.1:" + MOCK_PROVIDER.getAddress().getPort() + "/user")
+                        .userNameAttributeName("id").clientName("Mock Kakao").build();
+                @Override public ClientRegistration findByRegistrationId(String id) {
+                    return "google".equals(id) ? google : "github".equals(id) ? github : "kakao".equals(id) ? kakao : null;
+                }
+                @Override public boolean enabled(String provider) { return findByRegistrationId(provider) != null; }
+                @Override public boolean anyEnabled() { return true; }
+                @Override public java.util.Iterator<ClientRegistration> iterator() { return java.util.List.of(google, github, kakao).iterator(); }
+            };
+        }
     }
 
     private static String pem(String label, byte[] der) {
@@ -96,11 +199,13 @@ class AuthIntegrationTest {
         props.add("devfield.auth.service-keys.bff", () -> Secrets.sha256(BFF));
         props.add("devfield.auth.service-keys.project", () -> Secrets.sha256(PROJECT));
         props.add("devfield.auth.service-keys.interview", () -> Secrets.sha256(INTERVIEW));
+        props.add("AUTH_OAUTH_CONTEXT_KEY", () -> Base64.getEncoder().encodeToString(new byte[32]));
     }
 
     @Value("${local.server.port}") int port;
     @Autowired JdbcTemplate db;
     @Autowired Flyway flyway;
+    @Autowired OAuthFlowStore oauthFlows;
     private final ObjectMapper json = new ObjectMapper();
     @MockitoBean VerificationMailer mailer;
     private final HttpClient http = HttpClient.newHttpClient();
@@ -144,7 +249,7 @@ class AuthIntegrationTest {
     }
 
     @Test void migrationAndEmailLifecycle() throws Exception {
-        assertEquals(2, db.queryForObject("SELECT count(*) FROM auth.flyway_schema_history WHERE success", Integer.class));
+        assertEquals(3, db.queryForObject("SELECT count(*) FROM auth.flyway_schema_history WHERE success", Integer.class));
         assertEquals(0, flyway.migrate().migrationsExecuted);
         String email = UUID.randomUUID() + "@example.test";
         String token = signup(email);
@@ -160,6 +265,42 @@ class AuthIntegrationTest {
         assertEquals(401, bff("POST", "/api/auth/login", "{\"email\":\"" + email + "\",\"password\":\"wrong\"}", null).statusCode());
         assertEquals(202, bff("POST", "/api/auth/signup", "{\"email\":\"" + email + "\",\"password\":\"safe-test-password-123\",\"displayName\":\"Test\"}", null).statusCode());
         assertEquals(1, db.queryForObject("SELECT count(*) FROM auth.email_credential WHERE normalized_email=?", Integer.class, email));
+    }
+
+    @Test void v3UpgradesPopulatedV1V2WithoutLosingEmailOrSession() throws Exception {
+        String upgradeUrl = PG.getJdbcUrl().replace("/auth_test", "/auth_upgrade");
+        try (Connection connection = DriverManager.getConnection(PG.getJdbcUrl(), PG.getUsername(), PG.getPassword());
+             var statement = connection.createStatement()) {
+            statement.execute("CREATE DATABASE auth_upgrade OWNER " + PG.getUsername());
+        }
+        try (Connection connection = DriverManager.getConnection(upgradeUrl, PG.getUsername(), PG.getPassword());
+             var statement = connection.createStatement()) { statement.execute("CREATE SCHEMA auth"); }
+        var v2 = Flyway.configure().dataSource(upgradeUrl, PG.getUsername(), PG.getPassword())
+                .schemas("auth").defaultSchema("auth").locations("classpath:db/migration")
+                .target(org.flywaydb.core.api.MigrationVersion.fromVersion("2")).load();
+        assertEquals(2, v2.migrate().migrationsExecuted);
+        UUID user = UUID.randomUUID();
+        UUID credential = UUID.randomUUID();
+        UUID session = UUID.randomUUID();
+        try (Connection connection = DriverManager.getConnection(upgradeUrl, PG.getUsername(), PG.getPassword());
+             var statement = connection.createStatement()) {
+            statement.execute("INSERT INTO auth.devfield_user(id,display_name) VALUES ('" + user + "','Existing User')");
+            statement.execute("INSERT INTO auth.email_credential(id,user_id,normalized_email,password_hash,verified_at) VALUES ('" +
+                    credential + "','" + user + "','existing@example.test','" + "x".repeat(64) + "',now())");
+            statement.execute("INSERT INTO auth.auth_session(id,user_id,session_handle_hash,expires_at) VALUES ('" +
+                    session + "','" + user + "','" + "a".repeat(64) + "',now()+interval '1 day')");
+        }
+        var v3 = Flyway.configure().dataSource(upgradeUrl, PG.getUsername(), PG.getPassword())
+                .schemas("auth").defaultSchema("auth").locations("classpath:db/migration").load();
+        assertEquals(1, v3.migrate().migrationsExecuted);
+        assertEquals(0, v3.migrate().migrationsExecuted);
+        try (Connection connection = DriverManager.getConnection(upgradeUrl, PG.getUsername(), PG.getPassword());
+             var statement = connection.createStatement()) {
+            try (var rows = statement.executeQuery("SELECT count(*) FROM auth.email_credential c JOIN auth.devfield_user u ON c.user_id=u.id JOIN auth.auth_session s ON s.user_id=u.id WHERE c.normalized_email='existing@example.test' AND s.revoked_at IS NULL")) {
+                assertTrue(rows.next());
+                assertEquals(1, rows.getInt(1));
+            }
+        }
     }
 
     @Test void sessionJwtJwksAndLogout() throws Exception {
@@ -327,6 +468,127 @@ class AuthIntegrationTest {
         db.execute("ALTER TABLE auth.auth_session RENAME TO auth_session_temporarily_unavailable");
         try { assertEquals(503, check(jwt)); }
         finally { db.execute("ALTER TABLE auth.auth_session_temporarily_unavailable RENAME TO auth_session"); }
+    }
+
+    @Test void oauthIntentHandoffAndSocialReloginAreAtomic() {
+        String binding = Secrets.randomToken();
+        String flow = Secrets.randomToken();
+        String url = oauthFlows.createIntent("kakao", Secrets.sha256(binding), flow, "LOGIN_COMPLETE");
+        String intent = url.substring(url.indexOf("intent=") + 7);
+        String state = Secrets.randomToken();
+        oauthFlows.claimStart(intent, "kakao", state);
+        assertThrows(dev.devfield.auth.api.ApiError.class, () -> oauthFlows.claimStart(intent, "kakao", Secrets.randomToken()));
+        oauthFlows.saveRequest(state, new byte[]{1, 2, 3});
+        assertArrayEquals(new byte[]{1, 2, 3}, oauthFlows.requestBytes(state, true));
+        assertNull(oauthFlows.requestBytes(state, true));
+        String handoff = oauthFlows.createHandoff(state, "kakao", "stable-kakao-test-id", null);
+        var mismatch = assertThrows(dev.devfield.auth.api.ApiError.class,
+                () -> oauthFlows.exchange(handoff, Secrets.randomToken(), flow));
+        assertEquals(400, mismatch.status().value());
+        var first = oauthFlows.exchange(handoff, binding, flow);
+        assertNotNull(first.sessionHandle());
+        assertThrows(dev.devfield.auth.api.ApiError.class, () -> oauthFlows.exchange(handoff, binding, flow));
+        assertEquals(1, db.queryForObject("SELECT count(*) FROM auth.social_identity WHERE provider='kakao' AND provider_user_id='stable-kakao-test-id' AND provider_email IS NULL", Integer.class));
+
+        String secondBinding = Secrets.randomToken();
+        String secondFlow = Secrets.randomToken();
+        String secondUrl = oauthFlows.createIntent("kakao", Secrets.sha256(secondBinding), secondFlow, "LOGIN_COMPLETE");
+        String secondState = Secrets.randomToken();
+        oauthFlows.claimStart(secondUrl.substring(secondUrl.indexOf("intent=") + 7), "kakao", secondState);
+        String secondHandoff = oauthFlows.createHandoff(secondState, "kakao", "stable-kakao-test-id", null);
+        var second = oauthFlows.exchange(secondHandoff, secondBinding, secondFlow);
+        assertEquals(first.userId(), second.userId());
+        assertNotEquals(first.sessionHandle(), second.sessionHandle());
+    }
+
+    @Test void matchingProviderEmailDoesNotMergeWithEmailCredential() throws Exception {
+        String email = UUID.randomUUID() + "@example.test";
+        UUID emailUser = UUID.fromString(verifiedLogin(email).get("userId").asText());
+        String binding = Secrets.randomToken();
+        String flow = Secrets.randomToken();
+        String intentUrl = oauthFlows.createIntent("github", Secrets.sha256(binding), flow, "LOGIN_COMPLETE");
+        String state = Secrets.randomToken();
+        oauthFlows.claimStart(intentUrl.substring(intentUrl.indexOf("intent=") + 7), "github", state);
+        String handoff = oauthFlows.createHandoff(state, "github", "different-provider-id-" + UUID.randomUUID(), email);
+        UUID socialUser = oauthFlows.exchange(handoff, binding, flow).userId();
+        assertNotEquals(emailUser, socialUser);
+        assertEquals(1, db.queryForObject("SELECT count(*) FROM auth.email_credential WHERE user_id=?", Integer.class, emailUser));
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM auth.email_credential WHERE user_id=?", Integer.class, socialUser));
+    }
+
+    @Test void oauthHttpIntentAndAuthorizationStartRequireBffAndSingleUse() throws Exception {
+        String flow = Secrets.randomToken();
+        String binding = Secrets.randomToken();
+        String payload = json.writeValueAsString(java.util.Map.of("provider", "github", "browserBindingHash", Secrets.sha256(binding),
+                "returnRoute", "LOGIN_COMPLETE", "flowId", flow));
+        assertEquals(401, call("POST", "/internal/auth/oauth-intents", payload, null, null, null, null).statusCode());
+        var created = bff("POST", "/internal/auth/oauth-intents", payload, null);
+        assertEquals(201, created.statusCode());
+        String url = json.readTree(created.body()).get("authorizationUrl").asText();
+        String path = URI.create(url).getRawPath() + "?" + URI.create(url).getRawQuery();
+        var started = call("GET", path, null, null, null, null, null);
+        assertEquals(302, started.statusCode());
+        assertTrue(started.headers().firstValue("location").orElse("").startsWith("http://127.0.0.1:" + MOCK_PROVIDER.getAddress().getPort() + "/authorize?"));
+        assertEquals(1, db.queryForObject("SELECT count(*) FROM auth.action_token WHERE flow_id=? AND started_at IS NOT NULL AND oauth_request IS NOT NULL", Integer.class, flow));
+        assertEquals(410, call("GET", path, null, null, null, null, null).statusCode());
+    }
+
+    @Test void mockProviderCallbackHandoffAndRelogin() throws Exception {
+        String googleUser = mockProviderLogin("google");
+        assertEquals(googleUser, mockProviderLogin("google"));
+        String firstUser = mockProviderLogin("github");
+        assertEquals(firstUser, mockProviderLogin("github"));
+        String kakaoUser = mockProviderLogin("kakao");
+        assertEquals(kakaoUser, mockProviderLogin("kakao"));
+        assertNotEquals(firstUser, kakaoUser);
+        assertNotEquals(googleUser, firstUser);
+        assertNotEquals(googleUser, kakaoUser);
+        assertEquals(1, db.queryForObject("SELECT count(*) FROM auth.social_identity WHERE provider='google' AND provider_user_id='google-sub-654321'", Integer.class));
+        assertEquals(1, db.queryForObject("SELECT count(*) FROM auth.social_identity WHERE provider='github' AND provider_user_id='654321'", Integer.class));
+        assertEquals(1, db.queryForObject("SELECT count(*) FROM auth.social_identity WHERE provider='kakao' AND provider_user_id='654321' AND provider_email IS NULL", Integer.class));
+    }
+
+    @Test void productionRegistrationUsesStableIdsAndMinimumScopes() {
+        var providers = new OAuthProviders("google-id", "google-secret", "github-id", "github-secret",
+                "kakao-id", "kakao-secret", "http://127.0.0.1:18080");
+        assertEquals("sub", providers.findByRegistrationId("google").getProviderDetails().getUserInfoEndpoint().getUserNameAttributeName());
+        assertEquals(java.util.Set.of("openid"), providers.findByRegistrationId("google").getScopes());
+        assertEquals("id", providers.findByRegistrationId("github").getProviderDetails().getUserInfoEndpoint().getUserNameAttributeName());
+        assertTrue(providers.findByRegistrationId("github").getScopes() == null || providers.findByRegistrationId("github").getScopes().isEmpty());
+        assertEquals("id", providers.findByRegistrationId("kakao").getProviderDetails().getUserInfoEndpoint().getUserNameAttributeName());
+        assertTrue(providers.findByRegistrationId("kakao").getScopes() == null || providers.findByRegistrationId("kakao").getScopes().isEmpty());
+    }
+
+    private String mockProviderLogin(String provider) throws Exception {
+        String flow = Secrets.randomToken();
+        String binding = Secrets.randomToken();
+        String payload = json.writeValueAsString(java.util.Map.of("provider", provider, "browserBindingHash", Secrets.sha256(binding),
+                "returnRoute", "LOGIN_COMPLETE", "flowId", flow));
+        var created = bff("POST", "/internal/auth/oauth-intents", payload, null);
+        assertEquals(201, created.statusCode(), created.body());
+        URI startUri = URI.create(json.readTree(created.body()).get("authorizationUrl").asText());
+        var started = call("GET", startUri.getRawPath() + "?" + startUri.getRawQuery(), null, null, null, null, null);
+        assertEquals(302, started.statusCode(), started.body());
+        String authorize = started.headers().firstValue("location").orElseThrow();
+        String state = java.util.Arrays.stream(URI.create(authorize).getRawQuery().split("&"))
+                .filter(item -> item.startsWith("state=")).map(item -> URLDecoder.decode(item.substring(6), StandardCharsets.UTF_8))
+                .findFirst().orElseThrow();
+        GOOGLE_NONCE.set("google".equals(provider) ? java.util.Arrays.stream(URI.create(authorize).getRawQuery().split("&"))
+                .filter(item -> item.startsWith("nonce=")).map(item -> URLDecoder.decode(item.substring(6), StandardCharsets.UTF_8))
+                .findFirst().orElseThrow() : null);
+        var callback = call("GET", "/login/oauth2/code/" + provider + "?code=mock-code&state=" + state, null, null, null, null, null);
+        GOOGLE_NONCE.set(null);
+        assertEquals(303, callback.statusCode(), callback.body());
+        URI location = URI.create(callback.headers().firstValue("location").orElseThrow());
+        assertEquals("http://localhost:13000/auth/oauth/callback", location.getScheme() + "://" + location.getAuthority() + location.getPath());
+        String handoff = java.util.Arrays.stream(location.getRawFragment().split("&"))
+                .filter(item -> item.startsWith("handoff=")).map(item -> item.substring(8)).findFirst().orElseThrow();
+        var exchanged = bff("POST", "/internal/auth/oauth-handoffs/exchange",
+                json.writeValueAsString(java.util.Map.of("handoff", handoff, "browserBinding", binding, "flowId", flow)), null);
+        assertEquals(200, exchanged.statusCode(), exchanged.body());
+        assertEquals(410, bff("POST", "/internal/auth/oauth-handoffs/exchange",
+                json.writeValueAsString(java.util.Map.of("handoff", handoff, "browserBinding", binding, "flowId", flow)), null).statusCode());
+        return json.readTree(exchanged.body()).get("userId").asText();
     }
 
     private int check(String token) throws Exception {

@@ -43,7 +43,8 @@ public class ServiceCredentialFilter extends OncePerRequestFilter {
             String path = request.getServletPath();
             boolean bffOnly = path.equals("/api/auth/signup") || path.equals("/api/auth/verify-email") ||
                     path.equals("/api/auth/login") || path.equals("/api/auth/logout") ||
-                    path.equals("/internal/auth/session-token");
+                    path.equals("/internal/auth/session-token") || path.equals("/internal/auth/oauth-intents") ||
+                    path.equals("/internal/auth/oauth-handoffs/exchange");
             boolean consumerOnly = path.equals("/internal/auth/session-check");
             if ((bffOnly && !caller.equals("bff")) || (consumerOnly && caller.equals("bff"))) {
                 response.setStatus(HttpServletResponse.SC_FORBIDDEN);

@@ -1,4 +1,4 @@
-# DevField Auth — Phase 2-A
+# DevField Auth — Phase 2-A / Phase 2-B
 
 Java 21 / Spring Boot 4.0.9 service owning only the PostgreSQL `auth` schema. The API contract is in the DevField-Platform repository (`docs/contracts/auth/api-spec.md`).
 
@@ -13,19 +13,25 @@ Java 21 / Spring Boot 4.0.9 service owning only the PostgreSQL `auth` schema. Th
 | Public | `GET /api/auth/jwks` | `200` public RSA keys |
 | BFF | `POST /internal/auth/session-token` | `200` short-lived JWT, `Cache-Control: no-store` |
 | Project/Interview | `POST /internal/auth/session-check` | `204` active user and session |
+| BFF | `POST /internal/auth/oauth-intents` | `201` one-use provider start URL |
+| Browser | `GET /oauth2/authorization/{provider}` | Provider redirect after one-use Intent claim |
+| Provider | `GET /login/oauth2/code/{provider}` | Web callback handoff redirect |
+| BFF | `POST /internal/auth/oauth-handoffs/exchange` | `200` opaque handle and User ID |
 
-The BFF calls Auth on the server and places only the opaque handle in its host-only HttpOnly web cookie. Auth never sets a browser JWT cookie. The Web and Project integrations are later phases.
+The BFF calls Auth on the server and places only the opaque handle in its host-only HttpOnly web cookie. Auth never sets a browser JWT cookie. OAuth callback creates a short-lived handoff; User, SocialIdentity, and AuthSession are committed only on BFF exchange. The Project/Interview integrations are later phases.
 
 ## Local setup
 
 1. Start only the existing RepoQ local PostgreSQL Compose project if it is not running. Do not delete its volume.
 2. Run `scripts/init-local-auth.ps1` once. It creates a fresh RSA pair and independent service credentials under ignored `.local/`. It refuses to replace existing keys.
 3. In the PowerShell process for Auth, dot-source `../RepoQ/scripts/use-java21.ps1`, `../RepoQ/scripts/load-local-env.ps1`, and `.local/auth-local.ps1` in that order. The RepoQ script supplies `AUTH_DB_PASSWORD`.
-4. Provide an SMTP server at `AUTH_SMTP_HOST:AUTH_SMTP_PORT`, such as a local Mailpit instance. The Auth repository does not create or alter Mailpit. The verification link is `${AUTH_WEB_VERIFY_URL}#token=<proof>`; Phase 2-B will implement that Web route. For manual local verification, read the test mail in the local inbox and POST its proof through the BFF or an HTTP client using BFF service credentials. Never put the proof in an Auth URL query.
-5. Run `./gradlew.bat bootRun`. Flyway applies `V1` and `V2` to `auth` on startup. Check `GET http://127.0.0.1:18080/actuator/health`.
+4. Provide an SMTP server at `AUTH_SMTP_HOST:AUTH_SMTP_PORT`, such as the independent RepoQ Mailpit Compose. The verification link is `${AUTH_WEB_VERIFY_URL}#token=<proof>` and the Web route removes the fragment before calling the BFF. Never put the proof in an Auth URL query.
+5. Run `./gradlew.bat bootRun`. Flyway applies `V1` through `V3` to `auth` on startup. Check `GET http://127.0.0.1:18080/actuator/health`.
 6. Stop the Auth process with Ctrl+C. Leave other projects' containers and volumes untouched.
 
 `./gradlew.bat test` uses a disposable Testcontainers PostgreSQL database, generated test RSA key, and fake mail sender. `./gradlew.bat build` runs the tests and builds the JAR. Docker must be available for integration tests. No test clears the development DB.
+
+For Phase 2-B local Web integration, source an ignored OAuth/local override after `.local/auth-local.ps1`. Set SMTP to `127.0.0.1:11025`, the verification URL to `http://localhost:13000/verify-email`, Auth browser origin to `http://127.0.0.1:18080`, and Web OAuth callback to `http://localhost:13000/auth/oauth/callback`. Generate a fresh random 32-byte base64 `AUTH_OAUTH_CONTEXT_KEY` locally. Register the exact Provider callback `http://127.0.0.1:18080/login/oauth2/code/{provider}` in each Provider console, if that Provider permits loopback HTTP. Google, GitHub, and Kakao each require their own environment-only Client ID and Secret; a missing pair leaves that provider disabled while email Auth remains available. Never reuse PoC secrets. Provider console setup and real Provider E2E remain external tasks.
 
 ## Environment and credentials
 
@@ -37,4 +43,4 @@ Signup sends mail while its DB transaction is open: an SMTP failure rolls back t
 
 ## Later phases
 
-Phase 2-B: Web same-origin session cookie, CSRF/Origin checks, verification UI, server-only JWT requests, and cookie deletion. Phase 2-C: Project/Interview JWKS validation, AUTH-15 fail-closed check, and local resource ownership checks. OAuth, email-login addition, password reset, social links, and coordinated account deletion are outside Phase 2-A.
+Phase 2-C: Project/Interview JWKS validation, AUTH-15 fail-closed check, and local resource ownership checks. Password reset, explicit social links, and coordinated account deletion remain outside Phase 2-B.
