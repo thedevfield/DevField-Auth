@@ -31,6 +31,8 @@ public class ServiceCredentialFilter extends OncePerRequestFilter {
     @Override
     protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
             throws ServletException, IOException {
+        String path = request.getServletPath();
+        if (path.equals("/api/account/me")) response.setHeader("Cache-Control", "no-store");
         String caller = request.getHeader("X-DevField-Service");
         String key = request.getHeader("X-DevField-Service-Key");
         if (caller != null || key != null) {
@@ -40,11 +42,10 @@ public class ServiceCredentialFilter extends OncePerRequestFilter {
                 response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
                 return;
             }
-            String path = request.getServletPath();
             boolean bffOnly = path.equals("/api/auth/signup") || path.equals("/api/auth/verify-email") ||
                     path.equals("/api/auth/login") || path.equals("/api/auth/logout") ||
                     path.equals("/internal/auth/session-token") || path.equals("/internal/auth/oauth-intents") ||
-                    path.equals("/internal/auth/oauth-handoffs/exchange");
+                    path.equals("/internal/auth/oauth-handoffs/exchange") || path.equals("/api/account/me");
             boolean consumerOnly = path.equals("/internal/auth/session-check");
             if ((bffOnly && !caller.equals("bff")) || (consumerOnly && caller.equals("bff"))) {
                 response.setStatus(HttpServletResponse.SC_FORBIDDEN);

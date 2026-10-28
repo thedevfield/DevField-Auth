@@ -41,6 +41,7 @@ public class SecurityConfig {
                 .addFilterBefore(credentials, UsernamePasswordAuthenticationFilter.class)
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers(HttpMethod.GET, "/actuator/health", "/actuator/health/**", "/api/auth/jwks").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/account/me").hasAuthority("SERVICE_BFF")
                         .requestMatchers(HttpMethod.POST, "/api/auth/signup", "/api/auth/verify-email", "/api/auth/login",
                                 "/api/auth/logout", "/internal/auth/session-token", "/internal/auth/oauth-intents",
                                 "/internal/auth/oauth-handoffs/exchange").hasAuthority("SERVICE_BFF")
