@@ -259,6 +259,120 @@ class AuthIntegrationTest {
         return json.readTree(response.body());
     }
 
+    private OAuthFlowStore.HandoffResult socialLogin(String provider, String providerId, String providerEmail) {
+        String binding = Secrets.randomToken();
+        String flow = Secrets.randomToken();
+        String url = oauthFlows.createIntent(provider, Secrets.sha256(binding), flow, "LOGIN_COMPLETE");
+        String state = Secrets.randomToken();
+        oauthFlows.claimStart(url.substring(url.indexOf("intent=") + 7), provider, state);
+        String handoff = oauthFlows.createHandoff(state, provider, providerId, providerEmail);
+        return oauthFlows.exchange(handoff, binding, flow);
+    }
+
+    @Test void accountMeReturnsOnlyVerifiedEmailAccountFields() throws Exception {
+        String email = UUID.randomUUID() + "@example.test";
+        JsonNode login = verifiedLogin(email);
+        String handle = login.get("sessionHandle").asText();
+        var response = bff("GET", "/api/account/me", null, handle);
+        assertEquals(200, response.statusCode(), response.body());
+        assertTrue(response.headers().firstValue("cache-control").orElse("").contains("no-store"));
+        JsonNode profile = json.readTree(response.body());
+        assertEquals(java.util.Set.of("userId", "displayName", "email", "emailLoginEnabled", "socialProviders", "createdAt", "deletionStatus"),
+                java.util.stream.StreamSupport.stream(
+                        java.util.Spliterators.spliteratorUnknownSize(profile.fieldNames(), 0), false)
+                        .collect(java.util.stream.Collectors.toSet()));
+        UUID userId = UUID.fromString(login.get("userId").asText());
+        assertEquals(userId.toString(), profile.get("userId").asText());
+        assertEquals("Test User", profile.get("displayName").asText());
+        assertEquals(email, profile.get("email").asText());
+        assertTrue(profile.get("emailLoginEnabled").asBoolean());
+        assertTrue(profile.get("socialProviders").isEmpty());
+        assertEquals("NONE", profile.get("deletionStatus").asText());
+        assertEquals(db.queryForObject("SELECT created_at FROM auth.devfield_user WHERE id=?", java.sql.Timestamp.class, userId).toInstant(),
+                Instant.parse(profile.get("createdAt").asText()));
+        assertFalse(response.body().contains(handle));
+        assertFalse(response.body().contains("password_hash"));
+        assertFalse(response.body().contains("sessionHandle"));
+        assertEquals(400, bff("GET", "/api/account/me?userId=" + UUID.randomUUID(), null, handle).statusCode());
+        assertEquals(400, bff("GET", "/api/account/me", "{\"userId\":\"" + UUID.randomUUID() + "\"}", handle).statusCode());
+    }
+
+    @Test void accountMeSocialMethodsDoNotInventProfileData() throws Exception {
+        String providerEmail = "provider-" + UUID.randomUUID() + "@example.test";
+        String providerId = "account-me-github-" + UUID.randomUUID();
+        var login = socialLogin("github", providerId, providerEmail);
+        db.update("INSERT INTO auth.social_identity(id,user_id,provider,provider_user_id) VALUES (?,?,?,?)",
+                UUID.randomUUID(), login.userId(), "kakao", "account-me-kakao-" + UUID.randomUUID());
+        var response = bff("GET", "/api/account/me", null, login.sessionHandle());
+        assertEquals(200, response.statusCode(), response.body());
+        JsonNode profile = json.readTree(response.body());
+        assertEquals(login.userId().toString(), profile.get("userId").asText());
+        assertTrue(profile.get("displayName").isNull());
+        assertTrue(profile.get("email").isNull());
+        assertFalse(profile.get("emailLoginEnabled").asBoolean());
+        assertEquals(java.util.List.of("GITHUB", "KAKAO"),
+                java.util.stream.StreamSupport.stream(profile.get("socialProviders").spliterator(), false).map(JsonNode::asText).toList());
+        assertFalse(response.body().contains(providerEmail));
+        assertFalse(response.body().contains(providerId));
+        assertFalse(response.body().contains(login.sessionHandle()));
+        assertFalse(response.body().contains("provider_user_id"));
+    }
+
+    @Test void accountMeRequiresBffAndValidOwnSession() throws Exception {
+        JsonNode first = verifiedLogin(UUID.randomUUID() + "@example.test");
+        JsonNode second = verifiedLogin(UUID.randomUUID() + "@example.test");
+        String handle = first.get("sessionHandle").asText();
+        String path = "/api/account/me";
+        assertEquals(401, bff("GET", path, null, null).statusCode());
+        assertEquals(401, bff("GET", path, null, Secrets.randomToken()).statusCode());
+        assertEquals(401, call("GET", path, null, null, null, handle, null).statusCode());
+        assertEquals(401, call("GET", path, null, "bff", "wrong-bff-credential-with-sufficient-entropy", handle, null).statusCode());
+        assertEquals(403, call("GET", path, null, "project", PROJECT, handle, null).statusCode());
+        assertEquals(403, call("GET", path, null, "interview", INTERVIEW, handle, null).statusCode());
+        var own = bff("GET", path, null, handle);
+        assertEquals(first.get("userId").asText(), json.readTree(own.body()).get("userId").asText());
+        assertNotEquals(second.get("userId").asText(), json.readTree(own.body()).get("userId").asText());
+
+        db.update("UPDATE auth.auth_session SET revoked_at=now() WHERE session_handle_hash=?", Secrets.sha256(handle));
+        var revoked = bff("GET", path, null, handle);
+        assertEquals(401, revoked.statusCode());
+        assertTrue(revoked.headers().firstValue("cache-control").orElse("").contains("no-store"));
+        String secondHandle = second.get("sessionHandle").asText();
+        db.update("UPDATE auth.auth_session SET created_at=now()-interval '2 days',expires_at=now()-interval '1 second' " +
+                "WHERE session_handle_hash=?", Secrets.sha256(secondHandle));
+        assertEquals(401, bff("GET", path, null, secondHandle).statusCode());
+    }
+
+    @Test void accountMeAllowsDeletingWithoutGrantingJwtAndBlocksDeleted() throws Exception {
+        JsonNode login = verifiedLogin(UUID.randomUUID() + "@example.test");
+        String handle = login.get("sessionHandle").asText();
+        UUID userId = UUID.fromString(login.get("userId").asText());
+        db.update("UPDATE auth.devfield_user SET state='DELETING' WHERE id=?", userId);
+        var deleting = bff("GET", "/api/account/me", null, handle);
+        assertEquals(200, deleting.statusCode(), deleting.body());
+        assertEquals("DELETING", json.readTree(deleting.body()).get("deletionStatus").asText());
+        assertEquals(403, bff("POST", "/internal/auth/session-token", null, handle).statusCode());
+        db.update("UPDATE auth.devfield_user SET state='DELETED' WHERE id=?", userId);
+        var deleted = bff("GET", "/api/account/me", null, handle);
+        assertEquals(401, deleted.statusCode());
+        assertTrue(deleted.headers().firstValue("cache-control").orElse("").contains("no-store"));
+    }
+
+    @Test void accountMeDatabaseFailureDoesNotExposeData() throws Exception {
+        JsonNode login = verifiedLogin(UUID.randomUUID() + "@example.test");
+        String handle = login.get("sessionHandle").asText();
+        db.execute("ALTER TABLE auth.social_identity RENAME TO social_identity_temporarily_unavailable");
+        try {
+            var response = bff("GET", "/api/account/me", null, handle);
+            assertEquals(503, response.statusCode());
+            assertEquals("auth_unavailable", json.readTree(response.body()).get("code").asText());
+            assertTrue(response.headers().firstValue("cache-control").orElse("").contains("no-store"));
+            assertFalse(response.body().contains(handle));
+        } finally {
+            db.execute("ALTER TABLE auth.social_identity_temporarily_unavailable RENAME TO social_identity");
+        }
+    }
+
     @Test void migrationAndEmailLifecycle() throws Exception {
         assertEquals(4, db.queryForObject("SELECT count(*) FROM auth.flyway_schema_history WHERE success", Integer.class));
         assertEquals(0, flyway.migrate().migrationsExecuted);
