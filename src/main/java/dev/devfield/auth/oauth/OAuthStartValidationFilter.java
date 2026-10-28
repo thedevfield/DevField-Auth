@@ -10,7 +10,11 @@ import org.springframework.web.filter.OncePerRequestFilter;
 /** Gives invalid, expired, and reused starts the contracted response before Spring's redirect filter. */
 public class OAuthStartValidationFilter extends OncePerRequestFilter {
     private final OAuthFlowStore store;
-    public OAuthStartValidationFilter(OAuthFlowStore store) { this.store = store; }
+    private final OAuthProviders providers;
+    public OAuthStartValidationFilter(OAuthFlowStore store, OAuthProviders providers) {
+        this.store = store;
+        this.providers = providers;
+    }
 
     @Override protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
                                               FilterChain chain) throws ServletException, IOException {
@@ -20,8 +24,10 @@ public class OAuthStartValidationFilter extends OncePerRequestFilter {
             return;
         }
         String proof = request.getParameter("intent");
-        if (proof == null) { reject(response, 400, "invalid_oauth_intent"); return; }
         String provider = path.substring("/oauth2/authorization/".length());
+        if (!OAuthFlowStore.providerAllowed(provider)) { reject(response, 404, "unsupported_provider"); return; }
+        if (!providers.enabled(provider)) { reject(response, 503, "provider_unavailable"); return; }
+        if (proof == null || !OAuthFlowStore.flowAllowed(proof)) { reject(response, 400, "invalid_oauth_intent"); return; }
         if (!store.startAvailable(proof, provider)) { reject(response, 410, "oauth_intent_expired_or_used"); return; }
         chain.doFilter(request, response);
     }

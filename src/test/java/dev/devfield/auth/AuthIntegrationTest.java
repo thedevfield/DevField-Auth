@@ -20,6 +20,7 @@ import com.nimbusds.jwt.SignedJWT;
 import dev.devfield.auth.mail.VerificationMailer;
 import dev.devfield.auth.oauth.OAuthFlowStore;
 import dev.devfield.auth.oauth.OAuthProviders;
+import dev.devfield.auth.oauth.OAuthStartValidationFilter;
 import dev.devfield.auth.util.Secrets;
 import java.io.IOException;
 import java.net.URI;
@@ -37,11 +38,14 @@ import java.security.interfaces.RSAPublicKey;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.time.Instant;
+import java.time.Duration;
 import java.util.Base64;
 import java.util.Date;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -53,12 +57,17 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.context.annotation.Primary;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.dao.DataAccessException;
 import org.springframework.mail.MailSendException;
 import org.flywaydb.core.Flyway;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.mock.web.MockFilterChain;
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.mock.web.MockHttpServletResponse;
 import org.testcontainers.containers.PostgreSQLContainer;
 import com.sun.net.httpserver.HttpServer;
 import org.springframework.security.oauth2.client.registration.ClientRegistration;
@@ -200,12 +209,14 @@ class AuthIntegrationTest {
         props.add("devfield.auth.service-keys.project", () -> Secrets.sha256(PROJECT));
         props.add("devfield.auth.service-keys.interview", () -> Secrets.sha256(INTERVIEW));
         props.add("AUTH_OAUTH_CONTEXT_KEY", () -> Base64.getEncoder().encodeToString(new byte[32]));
+        props.add("devfield.auth.oauth.cleanup-interval-ms", () -> "86400000");
     }
 
     @Value("${local.server.port}") int port;
     @Autowired JdbcTemplate db;
     @Autowired Flyway flyway;
     @Autowired OAuthFlowStore oauthFlows;
+    @Autowired PlatformTransactionManager transactions;
     private final ObjectMapper json = new ObjectMapper();
     @MockitoBean VerificationMailer mailer;
     private final HttpClient http = HttpClient.newHttpClient();
@@ -249,7 +260,7 @@ class AuthIntegrationTest {
     }
 
     @Test void migrationAndEmailLifecycle() throws Exception {
-        assertEquals(3, db.queryForObject("SELECT count(*) FROM auth.flyway_schema_history WHERE success", Integer.class));
+        assertEquals(4, db.queryForObject("SELECT count(*) FROM auth.flyway_schema_history WHERE success", Integer.class));
         assertEquals(0, flyway.migrate().migrationsExecuted);
         String email = UUID.randomUUID() + "@example.test";
         String token = signup(email);
@@ -292,7 +303,7 @@ class AuthIntegrationTest {
         }
         var v3 = Flyway.configure().dataSource(upgradeUrl, PG.getUsername(), PG.getPassword())
                 .schemas("auth").defaultSchema("auth").locations("classpath:db/migration").load();
-        assertEquals(1, v3.migrate().migrationsExecuted);
+        assertEquals(2, v3.migrate().migrationsExecuted);
         assertEquals(0, v3.migrate().migrationsExecuted);
         try (Connection connection = DriverManager.getConnection(upgradeUrl, PG.getUsername(), PG.getPassword());
              var statement = connection.createStatement()) {
@@ -531,6 +542,152 @@ class AuthIntegrationTest {
         assertTrue(started.headers().firstValue("location").orElse("").startsWith("http://127.0.0.1:" + MOCK_PROVIDER.getAddress().getPort() + "/authorize?"));
         assertEquals(1, db.queryForObject("SELECT count(*) FROM auth.action_token WHERE flow_id=? AND started_at IS NOT NULL AND oauth_request IS NOT NULL", Integer.class, flow));
         assertEquals(410, call("GET", path, null, null, null, null, null).statusCode());
+        assertEquals(404, call("GET", "/oauth2/authorization/unknown?intent=" + Secrets.randomToken(), null, null, null, null, null).statusCode());
+        assertEquals(400, call("GET", "/oauth2/authorization/github?intent=bad", null, null, null, null, null).statusCode());
+        assertEquals(410, call("GET", "/oauth2/authorization/github?intent=" + Secrets.randomToken(), null, null, null, null, null).statusCode());
+        assertEquals(400, bff("POST", "/internal/auth/oauth-intents", payload.replace("github", "unknown"), null).statusCode());
+    }
+
+    @Test void disabledProviderStartReturns503() throws Exception {
+        OAuthProviders disabled = new OAuthProviders("", "", "", "", "", "", "http://127.0.0.1:18080");
+        var request = new MockHttpServletRequest("GET", "/oauth2/authorization/kakao");
+        request.setServletPath("/oauth2/authorization/kakao");
+        request.setParameter("intent", Secrets.randomToken());
+        var response = new MockHttpServletResponse();
+        new OAuthStartValidationFilter(oauthFlows, disabled).doFilter(request, response, new MockFilterChain());
+        assertEquals(503, response.getStatus());
+        assertTrue(response.getContentAsString().contains("provider_unavailable"));
+    }
+
+    @Test void oauthStartQuotaIsAtomicAndRecoversAfterWindow() throws Exception {
+        int recent = db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose='OAUTH_INTENT_LOGIN' AND created_at>now()-interval '2 seconds'", Integer.class);
+        OAuthFlowStore limited = new OAuthFlowStore(db, "http://127.0.0.1:18080", Duration.ofMinutes(5),
+                Duration.ofMinutes(2), Duration.ofDays(1), Duration.ofSeconds(2), recent + 2, 1000);
+        String bindingHash = Secrets.sha256(Secrets.randomToken());
+        startLimited(limited, "github", bindingHash);
+        startLimited(limited, "google", bindingHash);
+        var blocked = assertThrows(dev.devfield.auth.api.ApiError.class,
+                () -> startLimited(limited, "kakao", bindingHash));
+        assertEquals(429, blocked.status().value());
+        int afterBlock = db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose='OAUTH_INTENT_LOGIN'", Integer.class);
+        assertEquals(afterBlock, db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose='OAUTH_INTENT_LOGIN'", Integer.class));
+        Thread.sleep(2100);
+        startLimited(limited, "github", bindingHash);
+
+        int baseline = db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose='OAUTH_INTENT_LOGIN' AND created_at>now()-interval '1 hour'", Integer.class);
+        OAuthFlowStore oneMore = new OAuthFlowStore(db, "http://127.0.0.1:18080", Duration.ofMinutes(5),
+                Duration.ofMinutes(2), Duration.ofDays(1), Duration.ofHours(1), baseline + 1, 1000);
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch go = new CountDownLatch(1);
+        try (var workers = Executors.newFixedThreadPool(2)) {
+            Future<Integer> a = workers.submit(() -> quotaAttempt(oneMore, bindingHash, ready, go));
+            Future<Integer> b = workers.submit(() -> quotaAttempt(oneMore, bindingHash, ready, go));
+            assertTrue(ready.await(5, TimeUnit.SECONDS));
+            go.countDown();
+            assertEquals(java.util.Set.of(201, 429), java.util.Set.of(a.get(), b.get()));
+        }
+        assertEquals(baseline + 1, db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose='OAUTH_INTENT_LOGIN' AND created_at>now()-interval '1 hour'", Integer.class));
+    }
+
+    private int quotaAttempt(OAuthFlowStore store, String bindingHash, CountDownLatch ready, CountDownLatch go) throws Exception {
+        ready.countDown();
+        go.await();
+        try { startLimited(store, "github", bindingHash); return 201; }
+        catch (dev.devfield.auth.api.ApiError error) { return error.status().value(); }
+    }
+
+    private void startLimited(OAuthFlowStore store, String provider, String bindingHash) {
+        new TransactionTemplate(transactions).executeWithoutResult(status ->
+                store.createIntent(provider, bindingHash, Secrets.randomToken(), "LOGIN_COMPLETE"));
+    }
+
+    @Test void oauthActiveIntentCapPreventsAdditionalRows() {
+        int active = db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose='OAUTH_INTENT_LOGIN' AND expires_at>now()", Integer.class);
+        OAuthFlowStore capped = new OAuthFlowStore(db, "http://127.0.0.1:18080", Duration.ofMinutes(5),
+                Duration.ofMinutes(2), Duration.ofDays(1), Duration.ofMinutes(1), 10000, active + 1);
+        String bindingHash = Secrets.sha256(Secrets.randomToken());
+        startLimited(capped, "github", bindingHash);
+        int before = db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose='OAUTH_INTENT_LOGIN'", Integer.class);
+        assertEquals(429, assertThrows(dev.devfield.auth.api.ApiError.class,
+                () -> startLimited(capped, "google", bindingHash)).status().value());
+        assertEquals(before, db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose='OAUTH_INTENT_LOGIN'", Integer.class));
+    }
+
+    @Test void oauthHttpQuotaReturns429WithoutAddingIntent() throws Exception {
+        int recent = db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose='OAUTH_INTENT_LOGIN' AND created_at>now()-interval '1 minute'", Integer.class);
+        java.util.List<UUID> filler = new java.util.ArrayList<>();
+        try {
+            for (int i = recent; i < 120; i++) {
+                UUID id = UUID.randomUUID();
+                filler.add(id);
+                db.update("INSERT INTO auth.action_token(id,purpose,token_hash,expires_at,provider,flow_id,browser_binding_hash,return_route) " +
+                        "VALUES (?,'OAUTH_INTENT_LOGIN',?,now()+interval '5 minutes','github',?,?,'LOGIN_COMPLETE')",
+                        id, Secrets.sha256(Secrets.randomToken()), Secrets.randomToken(), Secrets.sha256(Secrets.randomToken()));
+            }
+            String body = json.writeValueAsString(java.util.Map.of("provider", "github", "browserBindingHash", Secrets.sha256(Secrets.randomToken()),
+                    "flowId", Secrets.randomToken(), "returnRoute", "LOGIN_COMPLETE"));
+            int before = db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose='OAUTH_INTENT_LOGIN'", Integer.class);
+            var response = bff("POST", "/internal/auth/oauth-intents", body, null);
+            assertEquals(429, response.statusCode(), response.body());
+            assertEquals(before, db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose='OAUTH_INTENT_LOGIN'", Integer.class));
+        } finally {
+            for (UUID id : filler) db.update("DELETE FROM auth.action_token WHERE id=?", id);
+        }
+    }
+
+    @Test void oauthCleanupIsBatchedFkSafeAndPreservesOtherData() {
+        while (oauthFlows.cleanupOAuth(1000) > 0) { /* drain only already due OAuth rows */ }
+        String binding = Secrets.randomToken();
+        String flow = Secrets.randomToken();
+        String url = oauthFlows.createIntent("github", Secrets.sha256(binding), flow, "LOGIN_COMPLETE");
+        String state = Secrets.randomToken();
+        oauthFlows.claimStart(url.substring(url.indexOf("intent=") + 7), "github", state);
+        String handoff = oauthFlows.createHandoff(state, "github", "cleanup-test-id", null);
+        String otherFlow = Secrets.randomToken();
+        String otherUrl = oauthFlows.createIntent("google", Secrets.sha256(binding), otherFlow, "LOGIN_COMPLETE");
+        String otherState = Secrets.randomToken();
+        oauthFlows.claimStart(otherUrl.substring(otherUrl.indexOf("intent=") + 7), "google", otherState);
+        oauthFlows.createHandoff(otherState, "google", "cleanup-other-id", null);
+        String liveFlow = Secrets.randomToken();
+        oauthFlows.createIntent("kakao", Secrets.sha256(binding), liveFlow, "LOGIN_COMPLETE");
+        int verifyBefore = db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose='VERIFY_SIGNUP'", Integer.class);
+        db.update("UPDATE auth.action_token SET created_at=now()-interval '2 minutes',expires_at=now()-interval '1 second' WHERE flow_id IN (?,?)", flow, otherFlow);
+        assertEquals(2, oauthFlows.cleanupOAuth(1));
+        assertEquals(2, db.queryForObject("SELECT count(*) FROM auth.action_token WHERE flow_id IN (?,?)", Integer.class, flow, otherFlow));
+        assertEquals(2, oauthFlows.cleanupOAuth(1));
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM auth.action_token WHERE flow_id IN (?,?)", Integer.class, flow, otherFlow));
+        assertEquals(0, oauthFlows.cleanupOAuth(1));
+        assertEquals(1, db.queryForObject("SELECT count(*) FROM auth.action_token WHERE flow_id=?", Integer.class, liveFlow));
+        assertEquals(verifyBefore, db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose='VERIFY_SIGNUP'", Integer.class));
+        assertEquals(410, assertThrows(dev.devfield.auth.api.ApiError.class,
+                () -> oauthFlows.exchange(handoff, binding, flow)).status().value());
+    }
+
+    @Test void oauthCleanupRacingExchangeDoesNotLoseSession() throws Exception {
+        String binding = Secrets.randomToken();
+        String flow = Secrets.randomToken();
+        String url = oauthFlows.createIntent("github", Secrets.sha256(binding), flow, "LOGIN_COMPLETE");
+        String state = Secrets.randomToken();
+        oauthFlows.claimStart(url.substring(url.indexOf("intent=") + 7), "github", state);
+        String handoff = oauthFlows.createHandoff(state, "github", "cleanup-race-" + UUID.randomUUID(), null);
+        CountDownLatch go = new CountDownLatch(1);
+        try (var workers = Executors.newFixedThreadPool(2)) {
+            Future<OAuthFlowStore.HandoffResult> exchange = workers.submit(() -> {
+                go.await();
+                return oauthFlows.exchange(handoff, binding, flow);
+            });
+            Future<Integer> cleanup = workers.submit(() -> {
+                go.await();
+                return oauthFlows.cleanupOAuth(1);
+            });
+            go.countDown();
+            var result = exchange.get();
+            cleanup.get();
+            assertEquals(1, db.queryForObject("SELECT count(*) FROM auth.auth_session WHERE session_handle_hash=? AND user_id=?",
+                    Integer.class, Secrets.sha256(result.sessionHandle()), result.userId()));
+            assertEquals(410, assertThrows(dev.devfield.auth.api.ApiError.class,
+                    () -> oauthFlows.exchange(handoff, binding, flow)).status().value());
+        }
     }
 
     @Test void mockProviderCallbackHandoffAndRelogin() throws Exception {
