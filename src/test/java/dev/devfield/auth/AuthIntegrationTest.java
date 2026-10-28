@@ -19,6 +19,10 @@ import com.nimbusds.jwt.JWTClaimsSet;
 import com.nimbusds.jwt.SignedJWT;
 import dev.devfield.auth.mail.VerificationMailer;
 import dev.devfield.auth.oauth.OAuthFlowStore;
+import dev.devfield.auth.oauth.GoogleReauthPolicy;
+import dev.devfield.auth.oauth.OAuthIntentResolver;
+import dev.devfield.auth.oauth.OAuthResultHandlers;
+import dev.devfield.auth.account.AccountChanges;
 import dev.devfield.auth.oauth.OAuthProviders;
 import dev.devfield.auth.oauth.OAuthStartValidationFilter;
 import dev.devfield.auth.util.Secrets;
@@ -87,6 +91,10 @@ class AuthIntegrationTest {
     private static final String INTERVIEW = "test-interview-credential-with-sufficient-entropy-00003";
     private static final HttpServer MOCK_PROVIDER;
     private static final AtomicReference<String> GOOGLE_NONCE = new AtomicReference<>();
+    private static final AtomicReference<String> GOOGLE_AUDIENCE = new AtomicReference<>("mock-google-client");
+    private static final AtomicReference<String> GOOGLE_SUB = new AtomicReference<>("google-sub-654321");
+    private static final AtomicReference<Long> GOOGLE_AUTH_TIME = new AtomicReference<>();
+    private static final AtomicReference<String> MOCK_GITHUB_ID = new AtomicReference<>("654321");
     static {
         try {
             PG.start();
@@ -104,11 +112,13 @@ class AuthIntegrationTest {
                 String idToken = "";
                 if (GOOGLE_NONCE.get() != null) {
                     try {
-                        var claims = new JWTClaimsSet.Builder()
+                        var builder = new JWTClaimsSet.Builder()
                                 .issuer("http://127.0.0.1:" + MOCK_PROVIDER.getAddress().getPort())
-                                .audience("mock-google-client").subject("google-sub-654321")
+                                .audience(GOOGLE_AUDIENCE.get()).subject(GOOGLE_SUB.get())
                                 .issueTime(Date.from(Instant.now())).expirationTime(Date.from(Instant.now().plusSeconds(300)))
-                                .claim("nonce", GOOGLE_NONCE.get()).build();
+                                .claim("nonce", GOOGLE_NONCE.get());
+                        if (GOOGLE_AUTH_TIME.get() != null) builder.claim("auth_time", GOOGLE_AUTH_TIME.get());
+                        var claims = builder.build();
                         var signed = new SignedJWT(new JWSHeader.Builder(JWSAlgorithm.RS256).keyID("mock-google-key").build(), claims);
                         signed.sign(new RSASSASigner(KEY.getPrivate()));
                         idToken = ",\"id_token\":\"" + signed.serialize() + "\"";
@@ -121,13 +131,13 @@ class AuthIntegrationTest {
                 try (var output = exchange.getResponseBody()) { output.write(body); }
             });
             MOCK_PROVIDER.createContext("/user", exchange -> {
-                byte[] body = "{\"id\":654321,\"login\":\"mock-account\"}".getBytes(StandardCharsets.UTF_8);
+                byte[] body = ("{\"id\":\"" + MOCK_GITHUB_ID.get() + "\",\"login\":\"mock-account\"}").getBytes(StandardCharsets.UTF_8);
                 exchange.getResponseHeaders().set("Content-Type", "application/json");
                 exchange.sendResponseHeaders(200, body.length);
                 try (var output = exchange.getResponseBody()) { output.write(body); }
             });
             MOCK_PROVIDER.createContext("/userinfo", exchange -> {
-                byte[] body = "{\"sub\":\"google-sub-654321\"}".getBytes(StandardCharsets.UTF_8);
+                byte[] body = ("{\"sub\":\"" + GOOGLE_SUB.get() + "\"}").getBytes(StandardCharsets.UTF_8);
                 exchange.getResponseHeaders().set("Content-Type", "application/json");
                 exchange.sendResponseHeaders(200, body.length);
                 try (var output = exchange.getResponseBody()) { output.write(body); }
@@ -209,6 +219,7 @@ class AuthIntegrationTest {
         props.add("devfield.auth.service-keys.project", () -> Secrets.sha256(PROJECT));
         props.add("devfield.auth.service-keys.interview", () -> Secrets.sha256(INTERVIEW));
         props.add("AUTH_OAUTH_CONTEXT_KEY", () -> Base64.getEncoder().encodeToString(new byte[32]));
+        props.add("AUTH_GOOGLE_REAUTH_IDENTITY_ONLY_ENABLED", () -> "true");
         props.add("devfield.auth.oauth.cleanup-interval-ms", () -> "86400000");
     }
 
@@ -216,6 +227,9 @@ class AuthIntegrationTest {
     @Autowired JdbcTemplate db;
     @Autowired Flyway flyway;
     @Autowired OAuthFlowStore oauthFlows;
+    @Autowired OAuthProviders oauthProviders;
+    @Autowired OAuthResultHandlers oauthResults;
+    @Autowired AccountChanges accountChanges;
     @Autowired PlatformTransactionManager transactions;
     private final ObjectMapper json = new ObjectMapper();
     @MockitoBean VerificationMailer mailer;
@@ -262,11 +276,366 @@ class AuthIntegrationTest {
     private OAuthFlowStore.HandoffResult socialLogin(String provider, String providerId, String providerEmail) {
         String binding = Secrets.randomToken();
         String flow = Secrets.randomToken();
-        String url = oauthFlows.createIntent(provider, Secrets.sha256(binding), flow, "LOGIN_COMPLETE");
+        boolean existing = db.queryForObject("SELECT count(*) FROM auth.social_identity WHERE provider=? AND provider_user_id=?", Integer.class, provider, providerId) > 0;
+        String route = existing ? "LOGIN_COMPLETE" : "SIGNUP_COMPLETE";
+        String url = oauthFlows.createIntent(provider, Secrets.sha256(binding), flow, route);
         String state = Secrets.randomToken();
         oauthFlows.claimStart(url.substring(url.indexOf("intent=") + 7), provider, state);
         String handoff = oauthFlows.createHandoff(state, provider, providerId, providerEmail);
-        return oauthFlows.exchange(handoff, binding, flow);
+        return oauthFlows.exchange(handoff, binding, flow, null, existing ? "LOGIN" : "SIGNUP");
+    }
+
+    private OAuthFlowStore.HandoffResult socialAttempt(String provider, String providerId, String route, String purpose) {
+        String binding = Secrets.randomToken(), flow = Secrets.randomToken();
+        String url = oauthFlows.createIntent(provider, Secrets.sha256(binding), flow, route);
+        String state = Secrets.randomToken();
+        oauthFlows.claimStart(url.substring(url.indexOf("intent=") + 7), provider, state);
+        String handoff = oauthFlows.createHandoff(state, provider, providerId, null);
+        return oauthFlows.exchange(handoff, binding, flow, null, purpose);
+    }
+
+    @Test void socialLoginAndSignupNeverSwitchIntent() {
+        String id = "intent-" + UUID.randomUUID();
+        int before = db.queryForObject("SELECT count(*) FROM auth.devfield_user", Integer.class);
+        var missing = socialAttempt("github", id, "LOGIN_COMPLETE", "LOGIN");
+        assertEquals("SIGNUP_REQUIRED", missing.outcome());
+        assertNull(missing.sessionHandle());
+        assertNull(missing.userId());
+        assertEquals(before, db.queryForObject("SELECT count(*) FROM auth.devfield_user", Integer.class));
+        var created = socialAttempt("github", id, "SIGNUP_COMPLETE", "SIGNUP");
+        assertEquals("SIGNED_UP", created.outcome());
+        assertNotNull(created.sessionHandle());
+        var duplicate = socialAttempt("github", id, "SIGNUP_COMPLETE", "SIGNUP");
+        assertEquals("EXISTING_ACCOUNT", duplicate.outcome());
+        assertNull(duplicate.sessionHandle());
+        assertNull(duplicate.userId());
+        assertEquals(before + 1, db.queryForObject("SELECT count(*) FROM auth.devfield_user", Integer.class));
+        var relogin = socialAttempt("github", id, "LOGIN_COMPLETE", "LOGIN");
+        assertEquals("LOGGED_IN", relogin.outcome());
+        assertEquals(created.userId(), relogin.userId());
+    }
+
+    @Test void googleReauthIdentityOnlyOmitsClaimsAndStrictModeRequiresThem() throws Exception {
+        var existing = socialLogin("google", "google-sub-654321", null);
+        String binding = Secrets.randomToken(), flow = Secrets.randomToken();
+        String url = accountChanges.socialProofStart(existing.sessionHandle(), "google", Secrets.sha256(binding), flow);
+        URI start = URI.create(url);
+        var response = call("GET", start.getRawPath() + "?" + start.getRawQuery(), null, null, null, null, null);
+        assertEquals(302, response.statusCode());
+        URI authorize = URI.create(response.headers().firstValue("location").orElseThrow());
+        assertFalse(authorize.getRawQuery().contains("claims="));
+
+        String strictBinding = Secrets.randomToken(), strictFlow = Secrets.randomToken();
+        String strictUrl = accountChanges.socialProofStart(existing.sessionHandle(), "google", Secrets.sha256(strictBinding), strictFlow);
+        var strictRequest = new MockHttpServletRequest("GET", "/oauth2/authorization/google");
+        strictRequest.setServletPath("/oauth2/authorization/google");
+        strictRequest.setParameter("intent", URI.create(strictUrl).getRawQuery().substring("intent=".length()));
+        var strict = new OAuthIntentResolver(oauthProviders, oauthFlows, new GoogleReauthPolicy(false)).resolve(strictRequest);
+        JsonNode claims = json.readTree((String) strict.getAdditionalParameters().get("claims"));
+        assertTrue(claims.path("id_token").path("auth_time").path("essential").asBoolean());
+        assertEquals(1, claims.size());
+        String strictEncoded = java.util.Arrays.stream(URI.create(strict.getAuthorizationRequestUri()).getRawQuery().split("&"))
+                .filter(item -> item.startsWith("claims="))
+                .map(item -> item.substring("claims=".length())).findFirst().orElseThrow();
+        assertEquals(claims, json.readTree(URLDecoder.decode(strictEncoded, StandardCharsets.UTF_8)));
+    }
+
+    @Test void googleReauthIdentityOnlyAcceptsMissingAuthTimeAndRejectsDifferentSub() throws Exception {
+        var existing = socialLogin("google", "google-sub-654321", null);
+        int sessionsBefore = db.queryForObject("SELECT count(*) FROM auth.auth_session WHERE user_id=?", Integer.class, existing.userId());
+        for (String sub : new String[]{"google-sub-654321", "different-google-sub"}) {
+            String binding = Secrets.randomToken(), flow = Secrets.randomToken();
+            String url = accountChanges.socialProofStart(existing.sessionHandle(), "google", Secrets.sha256(binding), flow);
+            URI start = URI.create(url);
+            var response = call("GET", start.getRawPath() + "?" + start.getRawQuery(), null, null, null, null, null);
+            assertEquals(302, response.statusCode());
+            URI authorize = URI.create(response.headers().firstValue("location").orElseThrow());
+            String state = java.util.Arrays.stream(authorize.getRawQuery().split("&"))
+                    .filter(item -> item.startsWith("state="))
+                    .map(item -> URLDecoder.decode(item.substring(6), StandardCharsets.UTF_8)).findFirst().orElseThrow();
+            GOOGLE_NONCE.set(java.util.Arrays.stream(authorize.getRawQuery().split("&"))
+                    .filter(item -> item.startsWith("nonce="))
+                    .map(item -> URLDecoder.decode(item.substring(6), StandardCharsets.UTF_8)).findFirst().orElseThrow());
+            GOOGLE_SUB.set(sub);
+            GOOGLE_AUTH_TIME.set(null);
+            HttpResponse<String> callback;
+            try { callback = call("GET", "/login/oauth2/code/google?code=mock-code&state=" + state, null, null, null, null, null); }
+            finally { GOOGLE_NONCE.set(null); GOOGLE_SUB.set("google-sub-654321"); }
+            assertEquals(303, callback.statusCode());
+            String location = callback.headers().firstValue("location").orElseThrow();
+            assertTrue(location.contains("&purpose=REAUTH"), location);
+            String handoff = java.util.Arrays.stream(URI.create(location).getRawFragment().split("&"))
+                    .filter(item -> item.startsWith("handoff=")).map(item -> item.substring(8)).findFirst().orElseThrow();
+            if (sub.equals("google-sub-654321")) {
+                var exchanged = oauthFlows.exchange(handoff, binding, flow, existing.sessionHandle(), "ACCOUNT");
+                assertEquals(existing.userId(), exchanged.userId());
+                assertNull(exchanged.sessionHandle());
+                assertNotNull(exchanged.reauthProof());
+            } else assertEquals(403, assertThrows(dev.devfield.auth.api.ApiError.class,
+                    () -> oauthFlows.exchange(handoff, binding, flow, existing.sessionHandle(), "ACCOUNT")).status().value());
+        }
+        assertEquals(sessionsBefore, db.queryForObject("SELECT count(*) FROM auth.auth_session WHERE user_id=?", Integer.class, existing.userId()));
+        assertEquals(200, bff("GET", "/api/account/me", null, existing.sessionHandle()).statusCode());
+    }
+
+    @Test void strictGoogleReauthRejectsMissingAndStaleAuthTime() throws Exception {
+        var existing = socialLogin("google", "google-sub-654321", null);
+        var strict = new OAuthResultHandlers(oauthFlows, "http://localhost:13000/auth/oauth/callback", new GoogleReauthPolicy(false));
+        for (Long authTime : new Long[]{null, Instant.now().minusSeconds(601).getEpochSecond(), Instant.now().plusSeconds(60).getEpochSecond(), Instant.now().minusSeconds(2).getEpochSecond()}) {
+            String binding = Secrets.randomToken(), flow = Secrets.randomToken();
+            String url = accountChanges.socialProofStart(existing.sessionHandle(), "google", Secrets.sha256(binding), flow);
+            String state = Secrets.randomToken();
+            oauthFlows.claimStart(URI.create(url).getRawQuery().substring("intent=".length()), "google", state);
+            var request = new MockHttpServletRequest("GET", "/login/oauth2/code/google");
+            request.setParameter("state", state);
+            var response = new MockHttpServletResponse();
+            var claims = new java.util.HashMap<String, Object>();
+            claims.put("sub", "google-sub-654321");
+            if (authTime != null) claims.put("auth_time", authTime);
+            var idToken = new org.springframework.security.oauth2.core.oidc.OidcIdToken("test-id-token", Instant.now(), Instant.now().plusSeconds(300), claims);
+            var user = new org.springframework.security.oauth2.core.oidc.user.DefaultOidcUser(java.util.List.of(), idToken);
+            strict.onAuthenticationSuccess(request, response,
+                    new org.springframework.security.oauth2.client.authentication.OAuth2AuthenticationToken(user, java.util.List.of(), "google"));
+            String location = response.getHeader("Location");
+            if (authTime == null) assertTrue(location.contains("#error=google_reauth_unavailable"));
+            else if (authTime < Instant.now().minusSeconds(300).getEpochSecond() || authTime > Instant.now().getEpochSecond())
+                assertTrue(location.contains("#error=google_reauth_stale"));
+            else assertTrue(location.contains("&purpose=REAUTH"));
+        }
+    }
+
+    @Test void googleIdentityOnlyStillRejectsInvalidIdTokenAndNonce() throws Exception {
+        var existing = socialLogin("google", "google-sub-654321", null);
+        for (String defect : new String[]{"audience", "nonce"}) {
+            String binding = Secrets.randomToken(), flow = Secrets.randomToken();
+            String url = accountChanges.socialProofStart(existing.sessionHandle(), "google", Secrets.sha256(binding), flow);
+            URI start = URI.create(url);
+            var started = call("GET", start.getRawPath() + "?" + start.getRawQuery(), null, null, null, null, null);
+            assertEquals(302, started.statusCode());
+            URI authorize = URI.create(started.headers().firstValue("location").orElseThrow());
+            String state = java.util.Arrays.stream(authorize.getRawQuery().split("&"))
+                    .filter(item -> item.startsWith("state="))
+                    .map(item -> URLDecoder.decode(item.substring(6), StandardCharsets.UTF_8)).findFirst().orElseThrow();
+            GOOGLE_NONCE.set("nonce".equals(defect) ? "wrong-nonce" : java.util.Arrays.stream(authorize.getRawQuery().split("&"))
+                    .filter(item -> item.startsWith("nonce="))
+                    .map(item -> URLDecoder.decode(item.substring(6), StandardCharsets.UTF_8)).findFirst().orElseThrow());
+            GOOGLE_AUDIENCE.set("audience".equals(defect) ? "wrong-client" : "mock-google-client");
+            HttpResponse<String> callback;
+            try { callback = call("GET", "/login/oauth2/code/google?code=mock-code&state=" + state, null, null, null, null, null); }
+            finally { GOOGLE_NONCE.set(null); GOOGLE_AUDIENCE.set("mock-google-client"); }
+            assertEquals(303, callback.statusCode());
+            assertTrue(callback.headers().firstValue("location").orElseThrow().contains("#error="));
+            assertFalse(callback.headers().firstValue("location").orElseThrow().contains("handoff="));
+        }
+        assertEquals(200, bff("GET", "/api/account/me", null, existing.sessionHandle()).statusCode());
+    }
+
+    @Test void oauthFailureSeparatesAccessDeniedProviderErrorAndCallbackFailure() throws Exception {
+        for (String providerError : new String[]{"access_denied", "invalid_request", ""}) {
+            String flow = Secrets.randomToken(), binding = Secrets.randomToken();
+            String url = oauthFlows.createIntent("google", Secrets.sha256(binding), flow, "LOGIN_COMPLETE");
+            String state = Secrets.randomToken();
+            oauthFlows.claimStart(url.substring(url.indexOf("intent=") + 7), "google", state);
+            var request = new MockHttpServletRequest("GET", "/login/oauth2/code/google");
+            request.setParameter("state", state);
+            if (!providerError.isEmpty()) request.setParameter("error", providerError);
+            var response = new MockHttpServletResponse();
+            oauthResults.onAuthenticationFailure(request, response,
+                    new org.springframework.security.oauth2.core.OAuth2AuthenticationException(
+                            new org.springframework.security.oauth2.core.OAuth2Error(providerError.isEmpty() ? "invalid_token_response" : providerError)));
+            String location = response.getHeader("Location");
+            assertEquals(303, response.getStatus());
+            assertTrue(location.contains("#error=" + (providerError.equals("access_denied") ? "oauth_cancelled"
+                    : providerError.isEmpty() ? "oauth_callback_failed" : "oauth_provider_rejected")));
+            assertTrue(location.contains("&flowId=" + flow));
+            assertTrue(location.matches(".*&ref=[0-9a-f-]{36}$"));
+            assertFalse(location.contains(state));
+        }
+    }
+
+    @Test void accountLinkRequiresRecentProofAndKeepsSession() throws Exception {
+        JsonNode login = verifiedLogin(UUID.randomUUID() + "@example.test");
+        String handle = login.get("sessionHandle").asText();
+        UUID user = UUID.fromString(login.get("userId").asText());
+        String binding = Secrets.randomToken(), flow = Secrets.randomToken();
+        assertEquals(403, assertThrows(dev.devfield.auth.api.ApiError.class,
+                () -> accountChanges.linkStart(handle, "github", Secrets.randomToken(), Secrets.sha256(binding), flow)).status().value());
+        String proof = accountChanges.passwordProof(handle, "safe-test-password-123");
+        String url = accountChanges.linkStart(handle, "github", proof, Secrets.sha256(binding), flow);
+        assertEquals(403, assertThrows(dev.devfield.auth.api.ApiError.class,
+                () -> accountChanges.linkStart(handle, "google", proof, Secrets.sha256(Secrets.randomToken()), Secrets.randomToken())).status().value());
+        String state = Secrets.randomToken();
+        oauthFlows.claimStart(url.substring(url.indexOf("intent=") + 7), "github", state);
+        String providerId = "link-" + UUID.randomUUID();
+        String handoff = oauthFlows.createHandoff(state, "github", providerId, null);
+        assertEquals(400, assertThrows(dev.devfield.auth.api.ApiError.class,
+                () -> oauthFlows.exchange(handoff, binding, flow, handle, "LOGIN")).status().value());
+        var linked = oauthFlows.exchange(handoff, binding, flow, handle, "ACCOUNT");
+        assertEquals(user, linked.userId());
+        assertNull(linked.sessionHandle());
+        assertEquals("LINK_COMPLETE", linked.returnRoute());
+        assertEquals(200, bff("GET", "/api/account/me", null, handle).statusCode());
+        assertEquals(2, db.queryForObject("SELECT count(*) FROM auth.social_identity WHERE user_id=?", Integer.class, user)
+                + db.queryForObject("SELECT count(*) FROM auth.email_credential WHERE user_id=? AND verified_at IS NOT NULL", Integer.class, user));
+        assertEquals(410, assertThrows(dev.devfield.auth.api.ApiError.class,
+                () -> oauthFlows.exchange(handoff, binding, flow, handle, "ACCOUNT")).status().value());
+        String otherHandle = socialLogin("github", providerId, null).sessionHandle();
+        assertEquals(user, socialLogin("github", providerId, null).userId());
+        String unlinkProof = accountChanges.passwordProof(handle, "safe-test-password-123");
+        accountChanges.unlink(handle, "github", unlinkProof);
+        assertEquals(401, bff("GET", "/api/account/me", null, otherHandle).statusCode());
+        assertEquals(200, bff("GET", "/api/account/me", null, handle).statusCode());
+        assertNotEquals(user, socialLogin("github", providerId, null).userId());
+    }
+
+    @Test void unregisteredMockProviderLinksToExistingUserWithoutReplacingSession() throws Exception {
+        JsonNode login = verifiedLogin(UUID.randomUUID() + "@example.test");
+        String handle = login.get("sessionHandle").asText();
+        String userId = login.get("userId").asText();
+        String providerId = "mock-link-" + UUID.randomUUID();
+        String binding = Secrets.randomToken(), flow = Secrets.randomToken();
+        int sessionsBefore = db.queryForObject("SELECT count(*) FROM auth.auth_session WHERE user_id=?", Integer.class, UUID.fromString(userId));
+        String proof = accountChanges.passwordProof(handle, "safe-test-password-123");
+        String url = accountChanges.linkStart(handle, "github", proof, Secrets.sha256(binding), flow);
+        MOCK_GITHUB_ID.set(providerId);
+        try {
+            URI start = URI.create(url);
+            var started = call("GET", start.getRawPath() + "?" + start.getRawQuery(), null, null, null, null, null);
+            assertEquals(302, started.statusCode());
+            URI authorize = URI.create(started.headers().firstValue("location").orElseThrow());
+            String state = java.util.Arrays.stream(authorize.getRawQuery().split("&"))
+                    .filter(item -> item.startsWith("state="))
+                    .map(item -> URLDecoder.decode(item.substring(6), StandardCharsets.UTF_8)).findFirst().orElseThrow();
+            var callback = call("GET", "/login/oauth2/code/github?code=mock-code&state=" + state, null, null, null, null, null);
+            assertEquals(303, callback.statusCode());
+            URI location = URI.create(callback.headers().firstValue("location").orElseThrow());
+            assertTrue(location.getRawFragment().contains("&purpose=LINK"));
+            String handoff = java.util.Arrays.stream(location.getRawFragment().split("&"))
+                    .filter(item -> item.startsWith("handoff=")).map(item -> item.substring(8)).findFirst().orElseThrow();
+            var exchanged = bff("POST", "/internal/auth/oauth-handoffs/exchange",
+                    json.writeValueAsString(java.util.Map.of("handoff", handoff, "browserBinding", binding,
+                            "flowId", flow, "expectedPurpose", "ACCOUNT")), handle);
+            assertEquals(200, exchanged.statusCode(), exchanged.body());
+            JsonNode result = json.readTree(exchanged.body());
+            assertEquals("LINKED", result.get("outcome").asText());
+            assertEquals(userId, result.get("userId").asText());
+            assertTrue(result.path("sessionHandle").isNull());
+            assertEquals(sessionsBefore, db.queryForObject("SELECT count(*) FROM auth.auth_session WHERE user_id=?", Integer.class, UUID.fromString(userId)));
+            assertEquals(200, bff("GET", "/api/account/me", null, handle).statusCode());
+            assertEquals(1, db.queryForObject("SELECT count(*) FROM auth.social_identity WHERE user_id=? AND provider='github' AND provider_user_id=?",
+                    Integer.class, UUID.fromString(userId), providerId));
+        } finally { MOCK_GITHUB_ID.set("654321"); }
+    }
+
+    @Test void unlinkRejectsLastMethodAndRevokesOtherSessions() throws Exception {
+        var social = socialLogin("github", "unlink-" + UUID.randomUUID(), null);
+        String only = social.sessionHandle();
+        String reauthBinding = Secrets.randomToken(), flow = Secrets.randomToken();
+        String url = accountChanges.socialProofStart(only, "github", Secrets.sha256(reauthBinding), flow);
+        String state = Secrets.randomToken();
+        oauthFlows.claimStart(url.substring(url.indexOf("intent=") + 7), "github", state);
+        String handoff = oauthFlows.createHandoff(state, "github", "wrong-provider-id", null);
+        assertEquals(403, assertThrows(dev.devfield.auth.api.ApiError.class,
+                () -> oauthFlows.exchange(handoff, reauthBinding, flow, only, "ACCOUNT")).status().value());
+        String correctId = db.queryForObject("SELECT provider_user_id FROM auth.social_identity WHERE user_id=? AND provider='github'", String.class, social.userId());
+        String goodBinding = Secrets.randomToken(), goodFlow = Secrets.randomToken();
+        String goodUrl = accountChanges.socialProofStart(only, "github", Secrets.sha256(goodBinding), goodFlow);
+        String goodState = Secrets.randomToken();
+        oauthFlows.claimStart(goodUrl.substring(goodUrl.indexOf("intent=") + 7), "github", goodState);
+        String goodHandoff = oauthFlows.createHandoff(goodState, "github", correctId, null);
+        String reauth = oauthFlows.exchange(goodHandoff, goodBinding, goodFlow, only, "ACCOUNT").reauthProof();
+        assertEquals(409, assertThrows(dev.devfield.auth.api.ApiError.class,
+                () -> accountChanges.unlink(only, "github", reauth)).status().value());
+    }
+
+    @Test void concurrentLastMethodUnlinkLeavesOneIdentity() throws Exception {
+        var social = socialLogin("github", "parallel-" + UUID.randomUUID(), null);
+        UUID user = social.userId();
+        db.update("INSERT INTO auth.social_identity(id,user_id,provider,provider_user_id) VALUES (?,?,?,?)",
+                UUID.randomUUID(), user, "google", "parallel-" + UUID.randomUUID());
+        String first = Secrets.randomToken(), second = Secrets.randomToken();
+        for (String proof : java.util.List.of(first, second))
+            db.update("INSERT INTO auth.action_token(id,user_id,session_id,purpose,token_hash,expires_at) " +
+                    "SELECT ?,?,s.id,'ACCOUNT_REAUTH',?,now()+interval '5 minutes' FROM auth.auth_session s " +
+                    "WHERE s.session_handle_hash=?", UUID.randomUUID(), user, Secrets.sha256(proof), Secrets.sha256(social.sessionHandle()));
+        var workers = Executors.newFixedThreadPool(2);
+        var ready = new CountDownLatch(2);
+        var go = new CountDownLatch(1);
+        try {
+            Future<Integer> a = workers.submit(() -> {
+                ready.countDown(); go.await();
+                try { accountChanges.unlink(social.sessionHandle(), "github", first); return 204; }
+                catch (dev.devfield.auth.api.ApiError e) { return e.status().value(); }
+            });
+            Future<Integer> b = workers.submit(() -> {
+                ready.countDown(); go.await();
+                try { accountChanges.unlink(social.sessionHandle(), "google", second); return 204; }
+                catch (dev.devfield.auth.api.ApiError e) { return e.status().value(); }
+            });
+            assertTrue(ready.await(5, TimeUnit.SECONDS)); go.countDown();
+            assertEquals(java.util.Set.of(204, 409), java.util.Set.of(a.get(), b.get()));
+            assertEquals(1, db.queryForObject("SELECT count(*) FROM auth.social_identity WHERE user_id=?", Integer.class, user));
+        } finally { workers.shutdownNow(); }
+    }
+
+    @Test void otherUsersProviderCannotBeLinkedOrMerged() throws Exception {
+        var owner = socialLogin("github", "owned-" + UUID.randomUUID(), null);
+        JsonNode email = verifiedLogin(UUID.randomUUID() + "@example.test");
+        String handle = email.get("sessionHandle").asText();
+        String proof = accountChanges.passwordProof(handle, "safe-test-password-123");
+        String binding = Secrets.randomToken(), flow = Secrets.randomToken();
+        String url = accountChanges.linkStart(handle, "github", proof, Secrets.sha256(binding), flow);
+        String state = Secrets.randomToken();
+        oauthFlows.claimStart(url.substring(url.indexOf("intent=") + 7), "github", state);
+        String providerId = db.queryForObject("SELECT provider_user_id FROM auth.social_identity WHERE user_id=? AND provider='github'",
+                String.class, owner.userId());
+        String handoff = oauthFlows.createHandoff(state, "github", providerId, "same@example.test");
+        assertEquals(409, assertThrows(dev.devfield.auth.api.ApiError.class,
+                () -> oauthFlows.exchange(handoff, binding, flow, handle, "ACCOUNT")).status().value());
+        assertEquals(owner.userId(), db.queryForObject("SELECT user_id FROM auth.social_identity WHERE provider='github' AND provider_user_id=?", UUID.class, providerId));
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM auth.social_identity WHERE user_id=?", Integer.class,
+                UUID.fromString(email.get("userId").asText())));
+    }
+
+    @Test void accountLinkHandoffFailsAfterLogoutOrDeleting() throws Exception {
+        for (boolean deleting : new boolean[]{false, true}) {
+            JsonNode login = verifiedLogin(UUID.randomUUID() + "@example.test");
+            String handle = login.get("sessionHandle").asText();
+            UUID user = UUID.fromString(login.get("userId").asText());
+            String proof = accountChanges.passwordProof(handle, "safe-test-password-123");
+            String binding = Secrets.randomToken(), flow = Secrets.randomToken();
+            String url = accountChanges.linkStart(handle, "github", proof, Secrets.sha256(binding), flow);
+            String state = Secrets.randomToken();
+            oauthFlows.claimStart(url.substring(url.indexOf("intent=") + 7), "github", state);
+            String providerId = "aborted-" + UUID.randomUUID();
+            String handoff = oauthFlows.createHandoff(state, "github", providerId, null);
+            if (deleting) db.update("UPDATE auth.devfield_user SET state='DELETING' WHERE id=?", user);
+            else assertEquals(204, bff("POST", "/api/auth/logout", null, handle).statusCode());
+            assertThrows(dev.devfield.auth.api.ApiError.class,
+                    () -> oauthFlows.exchange(handoff, binding, flow, handle, "ACCOUNT"));
+            assertEquals(0, db.queryForObject("SELECT count(*) FROM auth.social_identity WHERE provider='github' AND provider_user_id=?",
+                    Integer.class, providerId));
+        }
+    }
+
+    @Test void accountMutationRejectsMissingServiceCredential() throws Exception {
+        assertEquals(401, call("POST", "/api/account/reauth/password", "{\"password\":\"x\"}", null, null, null, null).statusCode());
+        assertEquals(401, call("POST", "/api/account/social-links/github", "{}", null, null, null, null).statusCode());
+        assertEquals(401, call("DELETE", "/api/account/social-links/github", "{}", null, null, null, null).statusCode());
+    }
+
+    @Test void logoutInvalidatesUnstartedAccountIntent() throws Exception {
+        JsonNode login = verifiedLogin(UUID.randomUUID() + "@example.test");
+        String handle = login.get("sessionHandle").asText();
+        String proof = accountChanges.passwordProof(handle, "safe-test-password-123");
+        String binding = Secrets.randomToken(), flow = Secrets.randomToken();
+        String url = accountChanges.linkStart(handle, "github", proof, Secrets.sha256(binding), flow);
+        String intent = url.substring(url.indexOf("intent=") + 7);
+        assertTrue(oauthFlows.startAvailable(intent, "github"));
+        assertEquals(204, bff("POST", "/api/auth/logout", null, handle).statusCode());
+        assertFalse(oauthFlows.startAvailable(intent, "github"));
+        assertThrows(dev.devfield.auth.api.ApiError.class,
+                () -> oauthFlows.claimStart(intent, "github", Secrets.randomToken()));
     }
 
     @Test void accountMeReturnsOnlyVerifiedEmailAccountFields() throws Exception {
@@ -374,7 +743,7 @@ class AuthIntegrationTest {
     }
 
     @Test void migrationAndEmailLifecycle() throws Exception {
-        assertEquals(4, db.queryForObject("SELECT count(*) FROM auth.flyway_schema_history WHERE success", Integer.class));
+        assertEquals(6, db.queryForObject("SELECT count(*) FROM auth.flyway_schema_history WHERE success", Integer.class));
         assertEquals(0, flyway.migrate().migrationsExecuted);
         String email = UUID.randomUUID() + "@example.test";
         String token = signup(email);
@@ -417,7 +786,7 @@ class AuthIntegrationTest {
         }
         var v3 = Flyway.configure().dataSource(upgradeUrl, PG.getUsername(), PG.getPassword())
                 .schemas("auth").defaultSchema("auth").locations("classpath:db/migration").load();
-        assertEquals(2, v3.migrate().migrationsExecuted);
+        assertEquals(4, v3.migrate().migrationsExecuted);
         assertEquals(0, v3.migrate().migrationsExecuted);
         try (Connection connection = DriverManager.getConnection(upgradeUrl, PG.getUsername(), PG.getPassword());
              var statement = connection.createStatement()) {
@@ -598,7 +967,7 @@ class AuthIntegrationTest {
     @Test void oauthIntentHandoffAndSocialReloginAreAtomic() {
         String binding = Secrets.randomToken();
         String flow = Secrets.randomToken();
-        String url = oauthFlows.createIntent("kakao", Secrets.sha256(binding), flow, "LOGIN_COMPLETE");
+        String url = oauthFlows.createIntent("kakao", Secrets.sha256(binding), flow, "SIGNUP_COMPLETE");
         String intent = url.substring(url.indexOf("intent=") + 7);
         String state = Secrets.randomToken();
         oauthFlows.claimStart(intent, "kakao", state);
@@ -610,7 +979,7 @@ class AuthIntegrationTest {
         var mismatch = assertThrows(dev.devfield.auth.api.ApiError.class,
                 () -> oauthFlows.exchange(handoff, Secrets.randomToken(), flow));
         assertEquals(400, mismatch.status().value());
-        var first = oauthFlows.exchange(handoff, binding, flow);
+        var first = oauthFlows.exchange(handoff, binding, flow, null, "SIGNUP");
         assertNotNull(first.sessionHandle());
         assertThrows(dev.devfield.auth.api.ApiError.class, () -> oauthFlows.exchange(handoff, binding, flow));
         assertEquals(1, db.queryForObject("SELECT count(*) FROM auth.social_identity WHERE provider='kakao' AND provider_user_id='stable-kakao-test-id' AND provider_email IS NULL", Integer.class));
@@ -631,11 +1000,11 @@ class AuthIntegrationTest {
         UUID emailUser = UUID.fromString(verifiedLogin(email).get("userId").asText());
         String binding = Secrets.randomToken();
         String flow = Secrets.randomToken();
-        String intentUrl = oauthFlows.createIntent("github", Secrets.sha256(binding), flow, "LOGIN_COMPLETE");
+        String intentUrl = oauthFlows.createIntent("github", Secrets.sha256(binding), flow, "SIGNUP_COMPLETE");
         String state = Secrets.randomToken();
         oauthFlows.claimStart(intentUrl.substring(intentUrl.indexOf("intent=") + 7), "github", state);
         String handoff = oauthFlows.createHandoff(state, "github", "different-provider-id-" + UUID.randomUUID(), email);
-        UUID socialUser = oauthFlows.exchange(handoff, binding, flow).userId();
+        UUID socialUser = oauthFlows.exchange(handoff, binding, flow, null, "SIGNUP").userId();
         assertNotEquals(emailUser, socialUser);
         assertEquals(1, db.queryForObject("SELECT count(*) FROM auth.email_credential WHERE user_id=?", Integer.class, emailUser));
         assertEquals(0, db.queryForObject("SELECT count(*) FROM auth.email_credential WHERE user_id=?", Integer.class, socialUser));
@@ -674,7 +1043,7 @@ class AuthIntegrationTest {
     }
 
     @Test void oauthStartQuotaIsAtomicAndRecoversAfterWindow() throws Exception {
-        int recent = db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose='OAUTH_INTENT_LOGIN' AND created_at>now()-interval '2 seconds'", Integer.class);
+        int recent = db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose LIKE 'OAUTH_INTENT_%' AND created_at>now()-interval '2 seconds'", Integer.class);
         OAuthFlowStore limited = new OAuthFlowStore(db, "http://127.0.0.1:18080", Duration.ofMinutes(5),
                 Duration.ofMinutes(2), Duration.ofDays(1), Duration.ofSeconds(2), recent + 2, 1000);
         String bindingHash = Secrets.sha256(Secrets.randomToken());
@@ -688,7 +1057,7 @@ class AuthIntegrationTest {
         Thread.sleep(2100);
         startLimited(limited, "github", bindingHash);
 
-        int baseline = db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose='OAUTH_INTENT_LOGIN' AND created_at>now()-interval '1 hour'", Integer.class);
+        int baseline = db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose LIKE 'OAUTH_INTENT_%' AND created_at>now()-interval '1 hour'", Integer.class);
         OAuthFlowStore oneMore = new OAuthFlowStore(db, "http://127.0.0.1:18080", Duration.ofMinutes(5),
                 Duration.ofMinutes(2), Duration.ofDays(1), Duration.ofHours(1), baseline + 1, 1000);
         CountDownLatch ready = new CountDownLatch(2);
@@ -700,7 +1069,7 @@ class AuthIntegrationTest {
             go.countDown();
             assertEquals(java.util.Set.of(201, 429), java.util.Set.of(a.get(), b.get()));
         }
-        assertEquals(baseline + 1, db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose='OAUTH_INTENT_LOGIN' AND created_at>now()-interval '1 hour'", Integer.class));
+        assertEquals(baseline + 1, db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose LIKE 'OAUTH_INTENT_%' AND created_at>now()-interval '1 hour'", Integer.class));
     }
 
     private int quotaAttempt(OAuthFlowStore store, String bindingHash, CountDownLatch ready, CountDownLatch go) throws Exception {
@@ -716,7 +1085,7 @@ class AuthIntegrationTest {
     }
 
     @Test void oauthActiveIntentCapPreventsAdditionalRows() {
-        int active = db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose='OAUTH_INTENT_LOGIN' AND expires_at>now()", Integer.class);
+        int active = db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose LIKE 'OAUTH_INTENT_%' AND expires_at>now()", Integer.class);
         OAuthFlowStore capped = new OAuthFlowStore(db, "http://127.0.0.1:18080", Duration.ofMinutes(5),
                 Duration.ofMinutes(2), Duration.ofDays(1), Duration.ofMinutes(1), 10000, active + 1);
         String bindingHash = Secrets.sha256(Secrets.randomToken());
@@ -728,7 +1097,7 @@ class AuthIntegrationTest {
     }
 
     @Test void oauthHttpQuotaReturns429WithoutAddingIntent() throws Exception {
-        int recent = db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose='OAUTH_INTENT_LOGIN' AND created_at>now()-interval '1 minute'", Integer.class);
+        int recent = db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose LIKE 'OAUTH_INTENT_%' AND created_at>now()-interval '1 minute'", Integer.class);
         java.util.List<UUID> filler = new java.util.ArrayList<>();
         try {
             for (int i = recent; i < 120; i++) {
@@ -753,7 +1122,7 @@ class AuthIntegrationTest {
         while (oauthFlows.cleanupOAuth(1000) > 0) { /* drain only already due OAuth rows */ }
         String binding = Secrets.randomToken();
         String flow = Secrets.randomToken();
-        String url = oauthFlows.createIntent("github", Secrets.sha256(binding), flow, "LOGIN_COMPLETE");
+        String url = oauthFlows.createIntent("github", Secrets.sha256(binding), flow, "SIGNUP_COMPLETE");
         String state = Secrets.randomToken();
         oauthFlows.claimStart(url.substring(url.indexOf("intent=") + 7), "github", state);
         String handoff = oauthFlows.createHandoff(state, "github", "cleanup-test-id", null);
@@ -780,7 +1149,7 @@ class AuthIntegrationTest {
     @Test void oauthCleanupRacingExchangeDoesNotLoseSession() throws Exception {
         String binding = Secrets.randomToken();
         String flow = Secrets.randomToken();
-        String url = oauthFlows.createIntent("github", Secrets.sha256(binding), flow, "LOGIN_COMPLETE");
+        String url = oauthFlows.createIntent("github", Secrets.sha256(binding), flow, "SIGNUP_COMPLETE");
         String state = Secrets.randomToken();
         oauthFlows.claimStart(url.substring(url.indexOf("intent=") + 7), "github", state);
         String handoff = oauthFlows.createHandoff(state, "github", "cleanup-race-" + UUID.randomUUID(), null);
@@ -788,7 +1157,7 @@ class AuthIntegrationTest {
         try (var workers = Executors.newFixedThreadPool(2)) {
             Future<OAuthFlowStore.HandoffResult> exchange = workers.submit(() -> {
                 go.await();
-                return oauthFlows.exchange(handoff, binding, flow);
+                return oauthFlows.exchange(handoff, binding, flow, null, "SIGNUP");
             });
             Future<Integer> cleanup = workers.submit(() -> {
                 go.await();
@@ -831,10 +1200,13 @@ class AuthIntegrationTest {
     }
 
     private String mockProviderLogin(String provider) throws Exception {
+        String providerId = "google".equals(provider) ? "google-sub-654321" : "654321";
+        boolean existing = db.queryForObject("SELECT count(*) FROM auth.social_identity WHERE provider=? AND provider_user_id=?", Integer.class, provider, providerId) > 0;
+        String purpose = existing ? "LOGIN" : "SIGNUP";
         String flow = Secrets.randomToken();
         String binding = Secrets.randomToken();
         String payload = json.writeValueAsString(java.util.Map.of("provider", provider, "browserBindingHash", Secrets.sha256(binding),
-                "returnRoute", "LOGIN_COMPLETE", "flowId", flow));
+                "returnRoute", purpose + "_COMPLETE", "flowId", flow));
         var created = bff("POST", "/internal/auth/oauth-intents", payload, null);
         assertEquals(201, created.statusCode(), created.body());
         URI startUri = URI.create(json.readTree(created.body()).get("authorizationUrl").asText());
@@ -855,10 +1227,10 @@ class AuthIntegrationTest {
         String handoff = java.util.Arrays.stream(location.getRawFragment().split("&"))
                 .filter(item -> item.startsWith("handoff=")).map(item -> item.substring(8)).findFirst().orElseThrow();
         var exchanged = bff("POST", "/internal/auth/oauth-handoffs/exchange",
-                json.writeValueAsString(java.util.Map.of("handoff", handoff, "browserBinding", binding, "flowId", flow)), null);
+                json.writeValueAsString(java.util.Map.of("handoff", handoff, "browserBinding", binding, "flowId", flow, "expectedPurpose", purpose)), null);
         assertEquals(200, exchanged.statusCode(), exchanged.body());
         assertEquals(410, bff("POST", "/internal/auth/oauth-handoffs/exchange",
-                json.writeValueAsString(java.util.Map.of("handoff", handoff, "browserBinding", binding, "flowId", flow)), null).statusCode());
+                json.writeValueAsString(java.util.Map.of("handoff", handoff, "browserBinding", binding, "flowId", flow, "expectedPurpose", purpose)), null).statusCode());
         return json.readTree(exchanged.body()).get("userId").asText();
     }
 

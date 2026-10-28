@@ -38,6 +38,8 @@ public class AuthSessions {
     @Transactional
     public void logout(String handle) {
         State session = byHandle(handle);
+        db.queryForObject("SELECT state FROM auth.devfield_user WHERE id=? FOR UPDATE", String.class, session.userId());
+        session = byHandle(handle);
         if (!session.active()) {
             Integer exists = db.queryForObject("SELECT count(*) FROM auth.auth_session WHERE id=? AND revoked_at IS NOT NULL AND expires_at>now()",
                     Integer.class, session.id());
