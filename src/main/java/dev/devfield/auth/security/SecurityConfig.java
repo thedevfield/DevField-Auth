@@ -50,8 +50,8 @@ public class SecurityConfig {
                                 "/login/oauth2/code/kakao").permitAll()
                         .anyRequest().denyAll())
                 ;
+        http.addFilterBefore(new OAuthStartValidationFilter(flows, providers), OAuth2AuthorizationRequestRedirectFilter.class);
         if (providers.anyEnabled()) {
-            http.addFilterBefore(new OAuthStartValidationFilter(flows), OAuth2AuthorizationRequestRedirectFilter.class);
             http.oauth2Login(oauth -> oauth.clientRegistrationRepository(providers)
                     .authorizedClientRepository(authorizedClients)
                     .authorizationEndpoint(auth -> auth.authorizationRequestResolver(new OAuthIntentResolver(providers, flows))

@@ -19,6 +19,8 @@ public class OAuthController {
 
     @PostMapping("/internal/auth/oauth-intents")
     ResponseEntity<?> createIntent(@RequestBody IntentRequest input) {
+        if (input.provider() == null || !OAuthFlowStore.providerAllowed(input.provider()))
+            throw new ApiError(HttpStatus.BAD_REQUEST, "invalid_oauth_intent");
         if (!providers.enabled(input.provider())) throw new ApiError(HttpStatus.SERVICE_UNAVAILABLE, "provider_unavailable");
         String url = store.createIntent(input.provider(), input.browserBindingHash(), input.flowId(), input.returnRoute());
         return ResponseEntity.created(URI.create(url)).body(Map.of("authorizationUrl", url));

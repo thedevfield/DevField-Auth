@@ -40,6 +40,11 @@ devfield:
       web-callback: ${AUTH_WEB_OAUTH_CALLBACK:http://localhost:13000/auth/oauth/callback}
       intent-ttl: ${AUTH_OAUTH_INTENT_TTL:PT5M}
       handoff-ttl: ${AUTH_OAUTH_HANDOFF_TTL:PT2M}
+      start-window: ${AUTH_OAUTH_START_WINDOW:PT1M}
+      max-starts-per-window: ${AUTH_OAUTH_MAX_STARTS_PER_WINDOW:120}
+      max-active-intents: ${AUTH_OAUTH_MAX_ACTIVE_INTENTS:600}
+      cleanup-interval-ms: ${AUTH_OAUTH_CLEANUP_INTERVAL_MS:30000}
+      cleanup-batch-size: ${AUTH_OAUTH_CLEANUP_BATCH_SIZE:100}
 
 management:
   health:
