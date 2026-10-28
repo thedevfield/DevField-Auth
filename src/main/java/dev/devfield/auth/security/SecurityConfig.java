@@ -1,6 +1,7 @@
 package dev.devfield.auth.security;
 
 import dev.devfield.auth.oauth.OAuthFlowStore;
+import dev.devfield.auth.oauth.GoogleReauthPolicy;
 import dev.devfield.auth.oauth.DiscardingAuthorizedClientRepository;
 import dev.devfield.auth.oauth.OAuthIntentResolver;
 import dev.devfield.auth.oauth.OAuthProviders;
@@ -30,7 +31,8 @@ public class SecurityConfig {
     SecurityFilterChain securityFilterChain(HttpSecurity http, ServiceCredentialFilter credentials,
                                             OAuthProviders providers, OAuthFlowStore flows,
                                             OAuthRequestRepository requests, OAuthResultHandlers results,
-                                            DiscardingAuthorizedClientRepository authorizedClients) throws Exception {
+                                            DiscardingAuthorizedClientRepository authorizedClients,
+                                            GoogleReauthPolicy googleReauthPolicy) throws Exception {
         http.csrf(csrf -> csrf.disable())
                 .httpBasic(basic -> basic.disable())
                 .formLogin(form -> form.disable())
@@ -42,9 +44,11 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers(HttpMethod.GET, "/actuator/health", "/actuator/health/**", "/api/auth/jwks").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/account/me").hasAuthority("SERVICE_BFF")
+                        .requestMatchers(HttpMethod.DELETE, "/api/account/social-links/*").hasAuthority("SERVICE_BFF")
                         .requestMatchers(HttpMethod.POST, "/api/auth/signup", "/api/auth/verify-email", "/api/auth/login",
                                 "/api/auth/logout", "/internal/auth/session-token", "/internal/auth/oauth-intents",
-                                "/internal/auth/oauth-handoffs/exchange").hasAuthority("SERVICE_BFF")
+                                "/internal/auth/oauth-handoffs/exchange", "/api/account/reauth/password",
+                                "/api/account/reauth/social/*", "/api/account/social-links/*").hasAuthority("SERVICE_BFF")
                         .requestMatchers(HttpMethod.POST, "/internal/auth/session-check").hasAnyAuthority("SERVICE_PROJECT", "SERVICE_INTERVIEW")
                         .requestMatchers(HttpMethod.GET, "/oauth2/authorization/google", "/oauth2/authorization/github",
                                 "/oauth2/authorization/kakao", "/login/oauth2/code/google", "/login/oauth2/code/github",
@@ -55,7 +59,7 @@ public class SecurityConfig {
         if (providers.anyEnabled()) {
             http.oauth2Login(oauth -> oauth.clientRegistrationRepository(providers)
                     .authorizedClientRepository(authorizedClients)
-                    .authorizationEndpoint(auth -> auth.authorizationRequestResolver(new OAuthIntentResolver(providers, flows))
+                    .authorizationEndpoint(auth -> auth.authorizationRequestResolver(new OAuthIntentResolver(providers, flows, googleReauthPolicy))
                             .authorizationRequestRepository(requests))
                     .successHandler(results).failureHandler(results));
         }
