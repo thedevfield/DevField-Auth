@@ -48,7 +48,10 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.POST, "/api/auth/signup", "/api/auth/verify-email", "/api/auth/login",
                                 "/api/auth/logout", "/internal/auth/session-token", "/internal/auth/oauth-intents",
                                 "/internal/auth/oauth-handoffs/exchange", "/api/account/reauth/password",
-                                "/api/account/reauth/social/*", "/api/account/social-links/*").hasAuthority("SERVICE_BFF")
+                                "/api/account/reauth/social/*", "/api/account/social-links/*",
+                                "/api/account/email-login/requests", "/api/account/email-login/verify",
+                                "/api/account/email-login/password", "/api/account/password/change",
+                                "/api/auth/password-reset-requests", "/api/auth/password-reset").hasAuthority("SERVICE_BFF")
                         .requestMatchers(HttpMethod.POST, "/internal/auth/session-check").hasAnyAuthority("SERVICE_PROJECT", "SERVICE_INTERVIEW")
                         .requestMatchers(HttpMethod.GET, "/oauth2/authorization/google", "/oauth2/authorization/github",
                                 "/oauth2/authorization/kakao", "/login/oauth2/code/google", "/login/oauth2/code/github",

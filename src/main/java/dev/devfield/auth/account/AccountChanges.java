@@ -42,7 +42,7 @@ public class AccountChanges {
         lockAndCheck(session);
         String limitKey = "reauth:" + session.userId();
         limiter.check(limitKey);
-        List<String> hashes = db.query("SELECT password_hash FROM auth.email_credential WHERE user_id=? AND verified_at IS NOT NULL",
+        List<String> hashes = db.query("SELECT password_hash FROM auth.email_credential WHERE user_id=? AND verified_at IS NOT NULL AND password_hash IS NOT NULL",
                 (rs, i) -> rs.getString(1), session.userId());
         if (hashes.isEmpty() || !passwords.matches(password, hashes.getFirst())) {
             limiter.fail(limitKey);
@@ -62,9 +62,9 @@ public class AccountChanges {
         Integer owned = db.queryForObject("SELECT count(*) FROM auth.social_identity WHERE user_id=? AND provider=?",
                 Integer.class, session.userId(), provider);
         if (owned == null || owned != 1) throw new ApiError(HttpStatus.CONFLICT, "social_link_conflict");
-        return flows.createIntent(provider, bindingHash, flowId, "REAUTH_COMPLETE", session.userId(), session.id());
+        return flows.createIntent(provider, bindingHash, flowId, "REAUTH_COMPLETE", session.userId(), session.id(), true);
     }
-    private void consumeProof(String proof, AuthSessions.State session) {
+    void consumeProof(String proof, AuthSessions.State session) {
         if (!OAuthFlowStore.flowAllowed(proof)) throw new ApiError(HttpStatus.FORBIDDEN, "reauth_required");
         var rows = db.query("UPDATE auth.action_token SET consumed_at=now() WHERE token_hash=? AND purpose='ACCOUNT_REAUTH' " +
                 "AND user_id=? AND session_id=? AND consumed_at IS NULL AND expires_at>now() RETURNING id",
@@ -80,7 +80,7 @@ public class AccountChanges {
         Integer existing = db.queryForObject("SELECT count(*) FROM auth.social_identity WHERE user_id=? AND provider=?",
                 Integer.class, session.userId(), provider);
         if (existing != null && existing > 0) throw new ApiError(HttpStatus.CONFLICT, "social_link_conflict");
-        return flows.createIntent(provider, bindingHash, flowId, "LINK_COMPLETE", session.userId(), session.id());
+        return flows.createIntent(provider, bindingHash, flowId, "LINK_COMPLETE", session.userId(), session.id(), true);
     }
     @Transactional
     public void unlink(String handle, String provider, String proof) {
@@ -88,7 +88,7 @@ public class AccountChanges {
         lockAndCheck(session);
         if (!OAuthFlowStore.providerAllowed(provider)) throw new ApiError(HttpStatus.BAD_REQUEST, "unsupported_provider");
         consumeProof(proof, session);
-        Integer email = db.queryForObject("SELECT count(*) FROM auth.email_credential WHERE user_id=? AND verified_at IS NOT NULL", Integer.class, session.userId());
+        Integer email = db.queryForObject("SELECT count(*) FROM auth.email_credential WHERE user_id=? AND verified_at IS NOT NULL AND password_hash IS NOT NULL", Integer.class, session.userId());
         Integer social = db.queryForObject("SELECT count(*) FROM auth.social_identity WHERE user_id=?", Integer.class, session.userId());
         Integer target = db.queryForObject("SELECT count(*) FROM auth.social_identity WHERE user_id=? AND provider=?", Integer.class, session.userId(), provider);
         if (target == null || target == 0) return;

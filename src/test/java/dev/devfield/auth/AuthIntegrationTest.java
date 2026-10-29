@@ -240,6 +240,10 @@ class AuthIntegrationTest {
         reset(mailer); proof.set(null);
         doAnswer(invocation -> { proof.set(invocation.getArgument(1)); return null; })
                 .when(mailer).send(anyString(), anyString());
+        doAnswer(invocation -> { proof.set(invocation.getArgument(1)); return null; })
+                .when(mailer).sendLink(anyString(), anyString());
+        doAnswer(invocation -> { proof.set(invocation.getArgument(1)); return null; })
+                .when(mailer).sendReset(anyString(), anyString());
     }
 
     private HttpResponse<String> call(String method, String path, String body, String service, String key,
@@ -292,6 +296,79 @@ class AuthIntegrationTest {
         oauthFlows.claimStart(url.substring(url.indexOf("intent=") + 7), provider, state);
         String handoff = oauthFlows.createHandoff(state, provider, providerId, null);
         return oauthFlows.exchange(handoff, binding, flow, null, purpose);
+    }
+
+    private String accountProof(String handle, UUID userId) {
+        String value = Secrets.randomToken();
+        UUID sessionId = db.queryForObject("SELECT id FROM auth.auth_session WHERE session_handle_hash=?", UUID.class, Secrets.sha256(handle));
+        db.update("INSERT INTO auth.action_token(id,user_id,session_id,purpose,token_hash,expires_at) VALUES (?,?,?,'ACCOUNT_REAUTH',?,?)",
+                UUID.randomUUID(), userId, sessionId, Secrets.sha256(value), java.sql.Timestamp.from(Instant.now().plusSeconds(300)));
+        return value;
+    }
+
+    @Test void socialEmailLinkPasswordChangeAndResetKeepOwnerAndRevokeSessions() throws Exception {
+        var social = socialLogin("github", "email-link-" + UUID.randomUUID(), null);
+        String email = "linked-" + UUID.randomUUID() + "@example.test";
+        String handle = social.sessionHandle();
+        String request = "{\"email\":\"" + email + "\"}";
+        assertEquals(403, bff("POST", "/api/account/email-login/requests", request, handle).statusCode());
+        String reauthProof = accountProof(handle, social.userId());
+        var requested = bff("POST", "/api/account/email-login/requests", "{\"email\":\"" + email + "\",\"reauthProof\":\"" + reauthProof + "\"}", handle);
+        assertEquals(202, requested.statusCode(), requested.body());
+        String linkToken = proof.get();
+        assertNotNull(linkToken);
+        assertEquals(410, bff("POST", "/api/account/email-login/verify", "{\"token\":\"" + Secrets.randomToken() + "\"}", handle).statusCode());
+        assertEquals(204, bff("POST", "/api/account/email-login/verify", "{\"token\":\"" + linkToken + "\"}", handle).statusCode());
+        assertEquals(410, bff("POST", "/api/account/email-login/verify", "{\"token\":\"" + linkToken + "\"}", handle).statusCode());
+        assertFalse(json.readTree(bff("GET", "/api/account/me", null, handle).body()).get("emailLoginEnabled").asBoolean());
+        assertEquals(204, bff("POST", "/api/account/email-login/password", "{\"password\":\"first-test-password-123\"}", handle).statusCode());
+        JsonNode account = json.readTree(bff("GET", "/api/account/me", null, handle).body());
+        assertEquals(social.userId().toString(), account.get("userId").asText());
+        assertTrue(account.get("emailLoginEnabled").asBoolean());
+        var login = bff("POST", "/api/auth/login", "{\"email\":\"" + email + "\",\"password\":\"first-test-password-123\"}", null);
+        assertEquals(social.userId().toString(), json.readTree(login.body()).get("userId").asText());
+        String otherSession = json.readTree(login.body()).get("sessionHandle").asText();
+        assertEquals(204, bff("POST", "/api/account/password/change", "{\"currentPassword\":\"first-test-password-123\",\"newPassword\":\"second-test-password-123\"}", handle).statusCode());
+        assertEquals(401, bff("GET", "/api/account/me", null, otherSession).statusCode());
+        assertEquals(200, bff("GET", "/api/account/me", null, handle).statusCode());
+        assertEquals(202, bff("POST", "/api/auth/password-reset-requests", request, null).statusCode());
+        String resetToken = proof.get();
+        assertNotEquals(linkToken, resetToken);
+        assertEquals(204, bff("POST", "/api/auth/password-reset", "{\"token\":\"" + resetToken + "\",\"password\":\"third-test-password-123\"}", null).statusCode());
+        assertEquals(410, bff("POST", "/api/auth/password-reset", "{\"token\":\"" + resetToken + "\",\"password\":\"third-test-password-123\"}", null).statusCode());
+        assertEquals(401, bff("GET", "/api/account/me", null, handle).statusCode());
+        var relogin = bff("POST", "/api/auth/login", "{\"email\":\"" + email + "\",\"password\":\"third-test-password-123\"}", null);
+        assertEquals(social.userId().toString(), json.readTree(relogin.body()).get("userId").asText());
+    }
+
+    @Test void emailLinkRejectsOtherOwnerAndExpiredOrWrongSessionToken() throws Exception {
+        String ownedEmail = "owner-" + UUID.randomUUID() + "@example.test";
+        verifiedLogin(ownedEmail);
+        var social = socialLogin("github", "email-conflict-" + UUID.randomUUID(), null);
+        String handle = social.sessionHandle();
+        String conflict = "{\"email\":\"" + ownedEmail + "\",\"reauthProof\":\"" + accountProof(handle, social.userId()) + "\"}";
+        var conflicting = bff("POST", "/api/account/email-login/requests", conflict, handle);
+        assertEquals(409, conflicting.statusCode(), conflicting.body());
+        String freshEmail = "pending-" + UUID.randomUUID() + "@example.test";
+        String request = "{\"email\":\"" + freshEmail + "\",\"reauthProof\":\"" + accountProof(handle, social.userId()) + "\"}";
+        var pending = bff("POST", "/api/account/email-login/requests", request, handle);
+        assertEquals(202, pending.statusCode(), pending.body());
+        String linkToken = proof.get();
+        var second = socialLogin("github", "email-conflict-" + UUID.randomUUID(), null);
+        assertEquals(410, bff("POST", "/api/account/email-login/verify", "{\"token\":\"" + linkToken + "\"}", second.sessionHandle()).statusCode());
+        db.update("UPDATE auth.action_token SET created_at=now()-interval '2 seconds',expires_at=now()-interval '1 second' WHERE token_hash=?", Secrets.sha256(linkToken));
+        assertEquals(410, bff("POST", "/api/account/email-login/verify", "{\"token\":\"" + linkToken + "\"}", handle).statusCode());
+        assertEquals(409, bff("POST", "/api/account/email-login/password", "{\"password\":\"safe-test-password-123\"}", handle).statusCode());
+    }
+
+    @Test void passwordResetRequestIsGenericAndDoesNotPersistFailedMail() throws Exception {
+        String email = "reset-" + UUID.randomUUID() + "@example.test";
+        String unknown = "unknown-" + UUID.randomUUID() + "@example.test";
+        verifiedLogin(email);
+        assertEquals(202, bff("POST", "/api/auth/password-reset-requests", "{\"email\":\"" + unknown + "\"}", null).statusCode());
+        doThrow(new MailSendException("local test failure")).when(mailer).sendReset(anyString(), anyString());
+        assertEquals(202, bff("POST", "/api/auth/password-reset-requests", "{\"email\":\"" + email + "\"}", null).statusCode());
+        assertEquals(0, db.queryForObject("SELECT count(*) FROM auth.action_token t JOIN auth.email_credential c ON c.id=t.email_credential_id WHERE c.normalized_email=? AND t.purpose='PASSWORD_RESET'", Integer.class, email));
     }
 
     @Test void socialLoginAndSignupNeverSwitchIntent() {
@@ -646,7 +723,7 @@ class AuthIntegrationTest {
         assertEquals(200, response.statusCode(), response.body());
         assertTrue(response.headers().firstValue("cache-control").orElse("").contains("no-store"));
         JsonNode profile = json.readTree(response.body());
-        assertEquals(java.util.Set.of("userId", "displayName", "email", "emailLoginEnabled", "socialProviders", "createdAt", "deletionStatus"),
+        assertEquals(java.util.Set.of("userId", "displayName", "email", "emailLoginEnabled", "emailLoginPending", "emailOwnershipVerified", "socialProviders", "createdAt", "deletionStatus"),
                 java.util.stream.StreamSupport.stream(
                         java.util.Spliterators.spliteratorUnknownSize(profile.fieldNames(), 0), false)
                         .collect(java.util.stream.Collectors.toSet()));
@@ -743,7 +820,7 @@ class AuthIntegrationTest {
     }
 
     @Test void migrationAndEmailLifecycle() throws Exception {
-        assertEquals(6, db.queryForObject("SELECT count(*) FROM auth.flyway_schema_history WHERE success", Integer.class));
+        assertEquals(7, db.queryForObject("SELECT count(*) FROM auth.flyway_schema_history WHERE success", Integer.class));
         assertEquals(0, flyway.migrate().migrationsExecuted);
         String email = UUID.randomUUID() + "@example.test";
         String token = signup(email);
@@ -786,7 +863,7 @@ class AuthIntegrationTest {
         }
         var v3 = Flyway.configure().dataSource(upgradeUrl, PG.getUsername(), PG.getPassword())
                 .schemas("auth").defaultSchema("auth").locations("classpath:db/migration").load();
-        assertEquals(4, v3.migrate().migrationsExecuted);
+        assertEquals(5, v3.migrate().migrationsExecuted);
         assertEquals(0, v3.migrate().migrationsExecuted);
         try (Connection connection = DriverManager.getConnection(upgradeUrl, PG.getUsername(), PG.getPassword());
              var statement = connection.createStatement()) {

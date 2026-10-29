@@ -62,7 +62,7 @@ public class AuthAccounts {
                 "VALUES (?,?,?,?,?) ON CONFLICT (normalized_email) DO NOTHING", proposed, normalized,
                 passwords.encode(password), displayName.strip(), Timestamp.from(Instant.now().plus(verificationTtl)));
         Credential row = credentialForUpdate(normalized);
-        if (row.verifiedAt != null) return;
+        if (row.userId != null || row.verifiedAt != null) return;
         Instant now = Instant.now();
         if (row.latestTokenAt != null && row.latestTokenAt.plus(signupCooldown).isAfter(now) &&
                 row.reservationExpiresAt.isAfter(now)) return;
@@ -109,7 +109,7 @@ public class AuthAccounts {
         String limitKey = "login:" + Secrets.sha256(normalized);
         limiter.check(limitKey);
         Credential row = credential(normalized);
-        if (row == null || !passwords.matches(password, row.hash)) {
+        if (row == null || row.hash == null || !passwords.matches(password, row.hash)) {
             limiter.fail(limitKey);
             throw new ApiError(HttpStatus.UNAUTHORIZED, "invalid_credentials");
         }
