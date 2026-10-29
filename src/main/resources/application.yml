@@ -16,6 +16,14 @@ spring:
   mail:
     host: ${AUTH_SMTP_HOST}
     port: ${AUTH_SMTP_PORT:1025}
+    username: ${AUTH_SMTP_USERNAME:}
+    password: ${AUTH_SMTP_PASSWORD:}
+    properties:
+      mail.smtp.auth: ${AUTH_SMTP_AUTH:false}
+      mail.smtp.starttls.enable: ${AUTH_SMTP_STARTTLS:false}
+      mail.smtp.connectiontimeout: ${AUTH_SMTP_CONNECTION_TIMEOUT_MS:5000}
+      mail.smtp.timeout: ${AUTH_SMTP_READ_TIMEOUT_MS:5000}
+      mail.smtp.writetimeout: ${AUTH_SMTP_WRITE_TIMEOUT_MS:5000}
 
 devfield:
   auth:
@@ -30,6 +38,8 @@ devfield:
     private-key-path: ${AUTH_PRIVATE_KEY_PATH}
     public-key-path: ${AUTH_PUBLIC_KEY_PATH}
     web-verify-url: ${AUTH_WEB_VERIFY_URL}
+    web-link-url: ${AUTH_WEB_LINK_URL:http://localhost:13000/account/email/verify}
+    web-reset-url: ${AUTH_WEB_RESET_URL:http://localhost:13000/reset-password/complete}
     mail-from: ${AUTH_MAIL_FROM}
     service-keys:
       bff: ${AUTH_BFF_KEY_SHA256}

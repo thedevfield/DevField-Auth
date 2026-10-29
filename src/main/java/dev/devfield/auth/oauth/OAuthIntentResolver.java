@@ -40,13 +40,14 @@ public class OAuthIntentResolver implements OAuth2AuthorizationRequestResolver {
             if ("kakao".equals(provider)) return OAuth2AuthorizationRequest.from(result)
                     .additionalParameters(params -> params.put("prompt", "login")).build();
             if ("google".equals(provider) && !googleReauthPolicy.identityOnlyEnabled()) return OAuth2AuthorizationRequest.from(result)
-                    .additionalParameters(params -> params.put("claims", "{\"id_token\":{\"auth_time\":{\"essential\":true}}}"))
+                    .additionalParameters(params -> { params.put("claims", "{\"id_token\":{\"auth_time\":{\"essential\":true}}}");
+                        if (intent.selectAccount()) params.put("prompt", "select_account"); })
                     .build();
             if ("github".equals(provider)) return OAuth2AuthorizationRequest.from(result)
                     .additionalParameters(params -> params.put("prompt", "select_account")).build();
         }
         if (intent.selectAccount()) return OAuth2AuthorizationRequest.from(result)
-                .additionalParameters(params -> params.put("prompt", "select_account")).build();
+                .additionalParameters(params -> params.put("prompt", "kakao".equals(provider) ? "login" : "select_account")).build();
         return result;
     }
 }
