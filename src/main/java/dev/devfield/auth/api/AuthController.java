@@ -7,6 +7,7 @@ import java.util.Map;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -52,10 +53,12 @@ public class AuthController {
     @GetMapping("/api/auth/jwks")
     Map<String, Object> jwks() { return tokens.jwks(); }
 
+    @Transactional
     @PostMapping("/internal/auth/session-token")
-    ResponseEntity<JwtTokens.Issued> token(@RequestHeader(value = "X-DevField-Session-Handle", required = false) String handle) {
+    public ResponseEntity<JwtTokens.Issued> token(@RequestHeader(value = "X-DevField-Session-Handle", required = false) String handle) {
         var state = sessions.byHandle(handle);
-        sessions.requireActive(state);
+        sessions.lockUser(state.userId());
+        sessions.requireActive(sessions.byHandle(handle));
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(tokens.issue(state.userId(), state.id()));
     }
 

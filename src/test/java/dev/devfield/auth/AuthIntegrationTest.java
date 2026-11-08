@@ -23,6 +23,7 @@ import dev.devfield.auth.oauth.GoogleReauthPolicy;
 import dev.devfield.auth.oauth.OAuthIntentResolver;
 import dev.devfield.auth.oauth.OAuthResultHandlers;
 import dev.devfield.auth.account.AccountChanges;
+import dev.devfield.auth.account.AccountDeletion;
 import dev.devfield.auth.oauth.OAuthProviders;
 import dev.devfield.auth.oauth.OAuthStartValidationFilter;
 import dev.devfield.auth.util.Secrets;
@@ -46,16 +47,21 @@ import java.time.Duration;
 import java.util.Base64;
 import java.util.Date;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.web.server.servlet.context.ServletWebServerApplicationContext;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
@@ -89,7 +95,19 @@ class AuthIntegrationTest {
     private static final String BFF = "test-bff-credential-with-sufficient-entropy-00001";
     private static final String PROJECT = "test-project-credential-with-sufficient-entropy-00002";
     private static final String INTERVIEW = "test-interview-credential-with-sufficient-entropy-00003";
+    private static final String X03 = "test-auth-x03-credential-with-sufficient-entropy";
+    private static final String X04 = "test-auth-x04-credential-with-sufficient-entropy";
     private static final HttpServer MOCK_PROVIDER;
+    private static final ConcurrentHashMap<UUID, DeletionTarget> DELETION_TARGETS = new ConcurrentHashMap<>();
+
+    private static final class DeletionTarget {
+        final AtomicInteger projectStatus = new AtomicInteger(204);
+        final AtomicInteger interviewStatus = new AtomicInteger(204);
+        final CopyOnWriteArrayList<UUID> projectJobs = new CopyOnWriteArrayList<>();
+        final CopyOnWriteArrayList<UUID> interviewJobs = new CopyOnWriteArrayList<>();
+        final CountDownLatch projectEntered = new CountDownLatch(1);
+        volatile CountDownLatch releaseProject;
+    }
     private static final AtomicReference<String> GOOGLE_NONCE = new AtomicReference<>();
     private static final AtomicReference<String> GOOGLE_AUDIENCE = new AtomicReference<>("mock-google-client");
     private static final AtomicReference<String> GOOGLE_SUB = new AtomicReference<>("google-sub-654321");
@@ -108,6 +126,39 @@ class AuthIntegrationTest {
             Files.writeString(PUBLIC, pem("PUBLIC KEY", KEY.getPublic().getEncoded()));
             PRIVATE.toFile().deleteOnExit(); PUBLIC.toFile().deleteOnExit(); dir.toFile().deleteOnExit();
             MOCK_PROVIDER = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            MOCK_PROVIDER.createContext("/internal/users/", exchange -> {
+                try (exchange) {
+                    JsonNode body = new ObjectMapper().readTree(exchange.getRequestBody());
+                    UUID user = UUID.fromString(body.path("userId").asText());
+                    UUID job = UUID.fromString(body.path("deletionJobId").asText());
+                    var target = DELETION_TARGETS.get(user);
+                    String key = exchange.getRequestHeaders().getFirst("X-DevField-Service-Key");
+                    if (target == null || !"DELETE".equals(exchange.getRequestMethod())
+                            || !exchange.getRequestURI().getPath().equals("/internal/users/" + user + "/data")
+                            || !"auth".equals(exchange.getRequestHeaders().getFirst("X-DevField-Service"))
+                            || !"DELETING".equals(body.path("state").asText())
+                            || !(X03.equals(key) || X04.equals(key))) {
+                        exchange.sendResponseHeaders(400, -1);
+                        return;
+                    }
+                    if (X03.equals(key)) {
+                        target.projectJobs.add(job);
+                        target.projectEntered.countDown();
+                        if (target.releaseProject != null) {
+                            try {
+                                if (!target.releaseProject.await(10, TimeUnit.SECONDS)) return;
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                return;
+                            }
+                        }
+                        exchange.sendResponseHeaders(target.projectStatus.get(), -1);
+                    } else {
+                        target.interviewJobs.add(job);
+                        if (target.interviewStatus.get() != 0) exchange.sendResponseHeaders(target.interviewStatus.get(), -1);
+                    }
+                }
+            });
             MOCK_PROVIDER.createContext("/token", exchange -> {
                 String idToken = "";
                 if (GOOGLE_NONCE.get() != null) {
@@ -221,6 +272,12 @@ class AuthIntegrationTest {
         props.add("AUTH_OAUTH_CONTEXT_KEY", () -> Base64.getEncoder().encodeToString(new byte[32]));
         props.add("AUTH_GOOGLE_REAUTH_IDENTITY_ONLY_ENABLED", () -> "true");
         props.add("devfield.auth.oauth.cleanup-interval-ms", () -> "86400000");
+        props.add("devfield.auth.deletion.project-url", () -> "http://127.0.0.1:" + MOCK_PROVIDER.getAddress().getPort());
+        props.add("devfield.auth.deletion.interview-url", () -> "http://127.0.0.1:" + MOCK_PROVIDER.getAddress().getPort());
+        props.add("devfield.auth.deletion.project-key", () -> X03);
+        props.add("devfield.auth.deletion.interview-key", () -> X04);
+        props.add("devfield.auth.deletion.timeout", () -> "PT10S");
+        props.add("devfield.auth.deletion.poll-ms", () -> "86400000");
     }
 
     @Value("${local.server.port}") int port;
@@ -230,6 +287,7 @@ class AuthIntegrationTest {
     @Autowired OAuthProviders oauthProviders;
     @Autowired OAuthResultHandlers oauthResults;
     @Autowired AccountChanges accountChanges;
+    @Autowired AccountDeletion accountDeletion;
     @Autowired PlatformTransactionManager transactions;
     private final ObjectMapper json = new ObjectMapper();
     @MockitoBean VerificationMailer mailer;
@@ -255,6 +313,23 @@ class AuthIntegrationTest {
         if (body != null) builder.header("Content-Type", "application/json");
         builder.method(method, body == null ? HttpRequest.BodyPublishers.noBody() : HttpRequest.BodyPublishers.ofString(body));
         return http.send(builder.build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private ServletWebServerApplicationContext startAuth(long pollMillis) {
+        String receiver = "http://127.0.0.1:" + MOCK_PROVIDER.getAddress().getPort();
+        return (ServletWebServerApplicationContext) new SpringApplicationBuilder(AuthApplication.class).run(
+                "--server.port=0", "--spring.datasource.url=" + PG.getJdbcUrl(),
+                "--spring.datasource.username=" + PG.getUsername(), "--spring.datasource.password=" + PG.getPassword(),
+                "--spring.mail.host=127.0.0.1", "--devfield.auth.issuer=https://auth.test.local",
+                "--devfield.auth.audience=devfield-user-api-test", "--devfield.auth.private-key-path=" + PRIVATE,
+                "--devfield.auth.public-key-path=" + PUBLIC, "--devfield.auth.web-verify-url=http://127.0.0.1:13000/verify",
+                "--devfield.auth.mail-from=test@example.test", "--devfield.auth.service-keys.bff=" + Secrets.sha256(BFF),
+                "--devfield.auth.service-keys.project=" + Secrets.sha256(PROJECT),
+                "--devfield.auth.service-keys.interview=" + Secrets.sha256(INTERVIEW),
+                "--AUTH_OAUTH_CONTEXT_KEY=" + Base64.getEncoder().encodeToString(new byte[32]),
+                "--devfield.auth.deletion.project-url=" + receiver, "--devfield.auth.deletion.interview-url=" + receiver,
+                "--devfield.auth.deletion.project-key=" + X03, "--devfield.auth.deletion.interview-key=" + X04,
+                "--devfield.auth.deletion.poll-ms=" + pollMillis);
     }
 
     private HttpResponse<String> bff(String method, String path, String body, String handle) throws Exception {
@@ -820,7 +895,7 @@ class AuthIntegrationTest {
     }
 
     @Test void migrationAndEmailLifecycle() throws Exception {
-        assertEquals(7, db.queryForObject("SELECT count(*) FROM auth.flyway_schema_history WHERE success", Integer.class));
+        assertEquals(9, db.queryForObject("SELECT count(*) FROM auth.flyway_schema_history WHERE success", Integer.class));
         assertEquals(0, flyway.migrate().migrationsExecuted);
         String email = UUID.randomUUID() + "@example.test";
         String token = signup(email);
@@ -863,7 +938,7 @@ class AuthIntegrationTest {
         }
         var v3 = Flyway.configure().dataSource(upgradeUrl, PG.getUsername(), PG.getPassword())
                 .schemas("auth").defaultSchema("auth").locations("classpath:db/migration").load();
-        assertEquals(5, v3.migrate().migrationsExecuted);
+        assertEquals(7, v3.migrate().migrationsExecuted);
         assertEquals(0, v3.migrate().migrationsExecuted);
         try (Connection connection = DriverManager.getConnection(upgradeUrl, PG.getUsername(), PG.getPassword());
              var statement = connection.createStatement()) {
@@ -973,6 +1048,203 @@ class AuthIntegrationTest {
         var response = bff("POST", "/api/auth/signup", "{\"email\":\"" + email + "\",\"password\":\"safe-test-password-123\",\"displayName\":\"Test\"}", null);
         assertEquals(503, response.statusCode());
         assertEquals(0, db.queryForObject("SELECT count(*) FROM auth.email_credential WHERE normalized_email=?", Integer.class, email));
+    }
+
+    @Test void accountDeletionResumesOnlyUnconfirmedServiceAndRevokesSession() throws Exception {
+        String email = UUID.randomUUID() + "@example.test";
+        JsonNode login = verifiedLogin(email);
+        UUID user = UUID.fromString(login.path("userId").asText());
+        String handle = login.path("sessionHandle").asText();
+        String other = verifiedLogin(UUID.randomUUID() + "@example.test").path("sessionHandle").asText();
+        String jwt = json.readTree(bff("POST", "/internal/auth/session-token", null, handle).body()).path("accessToken").asText();
+        String command = json.writeValueAsString(java.util.Map.of("reauthProof",
+                accountChanges.passwordProof(handle, "safe-test-password-123")));
+        String intent = accountChanges.linkStart(handle, "github",
+                accountChanges.passwordProof(handle, "safe-test-password-123"),
+                Secrets.sha256(Secrets.randomToken()), Secrets.randomToken());
+        String oauthState = Secrets.randomToken();
+        oauthFlows.claimStart(intent.substring(intent.indexOf("intent=") + 7), "github", oauthState);
+        var target = new DeletionTarget();
+        target.interviewStatus.set(0);
+        DELETION_TARGETS.put(user, target);
+        try {
+            assertEquals(401, call("DELETE", "/api/account/me", command, null, null, handle, null).statusCode());
+            assertEquals(403, bff("DELETE", "/api/account/me", command, other).statusCode());
+            assertEquals(403, bff("DELETE", "/api/account/me", null, handle).statusCode());
+            assertEquals(202, bff("DELETE", "/api/account/me", command, handle).statusCode());
+            UUID job = db.queryForObject("SELECT job_id FROM auth.account_deletion WHERE user_id=?", UUID.class, user);
+            assertEquals(java.util.List.of(job), target.projectJobs);
+            assertFalse(target.interviewJobs.isEmpty());
+            assertTrue(target.interviewJobs.stream().allMatch(job::equals));
+            int failedDeliveries = target.interviewJobs.size();
+            assertEquals(1, db.queryForObject("SELECT count(*) FROM auth.account_deletion WHERE user_id=? " +
+                    "AND project_completed_at IS NOT NULL AND interview_completed_at IS NULL AND completed_at IS NULL",
+                    Integer.class, user));
+            assertEquals("DELETING", json.readTree(bff("GET", "/api/account/me", null, handle).body()).path("deletionStatus").asText());
+            assertEquals(403, bff("POST", "/internal/auth/session-token", null, handle).statusCode());
+            assertEquals(403, check(jwt));
+            assertEquals("account_unavailable", assertThrows(dev.devfield.auth.api.ApiError.class,
+                    () -> oauthFlows.createHandoff(oauthState, "github", "late-provider", null)).code());
+            assertEquals(403, bff("POST", "/api/auth/login",
+                    "{\"email\":\"" + email + "\",\"password\":\"safe-test-password-123\"}", null).statusCode());
+            assertEquals(202, bff("POST", "/api/auth/password-reset-requests",
+                    "{\"email\":\"" + email + "\"}", null).statusCode());
+            assertEquals(0, db.queryForObject("SELECT count(*) FROM auth.action_token WHERE user_id=? AND purpose='PASSWORD_RESET'",
+                    Integer.class, user));
+            assertEquals(202, bff("DELETE", "/api/account/me", null, handle).statusCode());
+
+            target.interviewStatus.set(204);
+            // Simulate restart after a previously held claim expires.
+            db.update("UPDATE auth.account_deletion SET claim_id=?,next_attempt_at=clock_timestamp() WHERE user_id=?",
+                    UUID.randomUUID(), user);
+            String blocker = "auth.test_deletion_" + UUID.randomUUID().toString().replace("-", "");
+            db.execute("CREATE TABLE " + blocker + " (id uuid REFERENCES auth.auth_session(id))");
+            try {
+                db.update("INSERT INTO " + blocker + " SELECT id FROM auth.auth_session WHERE user_id=?", user);
+                assertThrows(DataAccessException.class, accountDeletion::poll);
+                assertEquals(1, db.queryForObject("SELECT count(*) FROM auth.account_deletion WHERE user_id=? " +
+                        "AND project_completed_at IS NOT NULL AND interview_completed_at IS NOT NULL AND completed_at IS NULL",
+                        Integer.class, user));
+                assertEquals(200, bff("GET", "/api/account/me", null, handle).statusCode());
+            } finally {
+                db.execute("DROP TABLE " + blocker);
+            }
+            db.update("UPDATE auth.account_deletion SET next_attempt_at=clock_timestamp() WHERE user_id=?", user);
+            accountDeletion.poll();
+            assertEquals(java.util.List.of(job), target.projectJobs);
+            assertEquals(failedDeliveries + 1, target.interviewJobs.size());
+            assertTrue(target.interviewJobs.stream().allMatch(job::equals));
+            assertEquals("DELETED", db.queryForObject("SELECT state FROM auth.devfield_user WHERE id=? AND display_name IS NULL",
+                    String.class, user));
+            for (String table : java.util.List.of("auth_session", "action_token", "email_credential", "social_identity"))
+                assertEquals(0, db.queryForObject("SELECT count(*) FROM auth." + table + " WHERE user_id=?", Integer.class, user));
+            assertEquals(401, bff("DELETE", "/api/account/me", command, handle).statusCode());
+            assertEquals(401, check(jwt));
+            assertEquals(200, bff("GET", "/api/account/me", null, other).statusCode());
+        } finally {
+            DELETION_TARGETS.remove(user);
+        }
+    }
+
+    @Test void restartedAuthSchedulerFinishesPendingDeletionWithoutBrowserRequest() throws Exception {
+        JsonNode login = verifiedLogin(UUID.randomUUID() + "@example.test");
+        UUID user = UUID.fromString(login.path("userId").asText());
+        String handle = login.path("sessionHandle").asText();
+        String command = json.writeValueAsString(java.util.Map.of("reauthProof",
+                accountChanges.passwordProof(handle, "safe-test-password-123")));
+        var target = new DeletionTarget();
+        target.interviewStatus.set(503);
+        DELETION_TARGETS.put(user, target);
+        try {
+            try (var first = startAuth(86400000)) {
+                int authPort = first.getWebServer().getPort();
+                var request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + authPort + "/api/account/me"))
+                        .header("X-DevField-Service", "bff").header("X-DevField-Service-Key", BFF)
+                        .header("X-DevField-Session-Handle", handle).header("Content-Type", "application/json")
+                        .method("DELETE", HttpRequest.BodyPublishers.ofString(command)).build();
+                assertEquals(202, http.send(request, HttpResponse.BodyHandlers.discarding()).statusCode());
+            }
+            UUID job = db.queryForObject("SELECT job_id FROM auth.account_deletion WHERE user_id=? AND " +
+                    "project_completed_at IS NOT NULL AND interview_completed_at IS NULL", UUID.class, user);
+            assertEquals(java.util.List.of(job), target.projectJobs);
+            assertEquals(java.util.List.of(job), target.interviewJobs);
+            target.interviewStatus.set(204);
+            db.update("UPDATE auth.account_deletion SET next_attempt_at=clock_timestamp() WHERE user_id=?", user);
+            try (var restarted = startAuth(100)) {
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                boolean completed;
+                do {
+                    completed = Boolean.TRUE.equals(db.queryForObject(
+                            "SELECT completed_at IS NOT NULL FROM auth.account_deletion WHERE user_id=?", Boolean.class, user));
+                    if (!completed) Thread.sleep(50);
+                } while (!completed && System.nanoTime() < deadline);
+                assertTrue(completed, "restarted Auth did not finish deletion");
+                assertEquals(java.util.List.of(job), target.projectJobs);
+                assertEquals(java.util.List.of(job, job), target.interviewJobs);
+                assertEquals(401, bff("DELETE", "/api/account/me", null, handle).statusCode());
+            }
+        } finally {
+            DELETION_TARGETS.remove(user);
+        }
+    }
+
+    @Test void deletionInvalidatesAnonymousHandoffAndLateCallbackForLinkedIdentity() throws Exception {
+        JsonNode login = verifiedLogin(UUID.randomUUID() + "@example.test");
+        UUID user = UUID.fromString(login.path("userId").asText());
+        String handle = login.path("sessionHandle").asText();
+        String providerId = "delete-" + UUID.randomUUID();
+        db.update("INSERT INTO auth.social_identity(id,user_id,provider,provider_user_id) VALUES (?,?,'github',?)",
+                UUID.randomUUID(), user, providerId);
+        String binding = Secrets.randomToken();
+        String flow = Secrets.randomToken();
+        String oldState = startSocialSignup(binding, flow);
+        String handoff = oauthFlows.createHandoff(oldState, "github", providerId, null);
+        String lateState = startSocialSignup(Secrets.randomToken(), Secrets.randomToken());
+        String command = json.writeValueAsString(java.util.Map.of("reauthProof",
+                accountChanges.passwordProof(handle, "safe-test-password-123")));
+        var target = new DeletionTarget();
+        target.interviewStatus.set(503);
+        DELETION_TARGETS.put(user, target);
+        try {
+            assertEquals(202, bff("DELETE", "/api/account/me", command, handle).statusCode());
+            assertEquals("account_unavailable", assertThrows(dev.devfield.auth.api.ApiError.class,
+                    () -> oauthFlows.createHandoff(lateState, "github", providerId, null)).code());
+            target.interviewStatus.set(204);
+            db.update("UPDATE auth.account_deletion SET next_attempt_at=clock_timestamp() WHERE user_id=?", user);
+            assertEquals(204, bff("DELETE", "/api/account/me", null, handle).statusCode());
+            assertEquals(0, db.queryForObject("SELECT count(*) FROM auth.action_token WHERE token_hash=?",
+                    Integer.class, Secrets.sha256(handoff)));
+            assertEquals("handoff_expired_or_used", assertThrows(dev.devfield.auth.api.ApiError.class,
+                    () -> oauthFlows.exchange(handoff, binding, flow, null, "SIGNUP")).code());
+            assertEquals("oauth_intent_expired_or_used", assertThrows(dev.devfield.auth.api.ApiError.class,
+                    () -> oauthFlows.createHandoff(lateState, "github", providerId, null)).code());
+            assertEquals(0, db.queryForObject("SELECT count(*) FROM auth.social_identity WHERE provider_user_id=?",
+                    Integer.class, providerId));
+
+            String newBinding = Secrets.randomToken();
+            String newFlow = Secrets.randomToken();
+            String newState = startSocialSignup(newBinding, newFlow);
+            String freshHandoff = oauthFlows.createHandoff(newState, "github", providerId, null);
+            var fresh = oauthFlows.exchange(freshHandoff, newBinding, newFlow, null, "SIGNUP");
+            assertEquals("SIGNED_UP", fresh.outcome());
+            assertNotEquals(user, fresh.userId());
+        } finally {
+            DELETION_TARGETS.remove(user);
+        }
+    }
+
+    private String startSocialSignup(String binding, String flow) {
+        String url = oauthFlows.createIntent("github", Secrets.sha256(binding), flow, "SIGNUP_COMPLETE");
+        String state = Secrets.randomToken();
+        oauthFlows.claimStart(url.substring(url.indexOf("intent=") + 7), "github", state);
+        return state;
+    }
+
+    @Test void concurrentAccountDeletionUsesOneJobAndCompletingRequestReturns204() throws Exception {
+        JsonNode login = verifiedLogin(UUID.randomUUID() + "@example.test");
+        UUID user = UUID.fromString(login.path("userId").asText());
+        String handle = login.path("sessionHandle").asText();
+        String command = json.writeValueAsString(java.util.Map.of("reauthProof",
+                accountChanges.passwordProof(handle, "safe-test-password-123")));
+        var target = new DeletionTarget();
+        target.releaseProject = new CountDownLatch(1);
+        DELETION_TARGETS.put(user, target);
+        try (var callers = Executors.newFixedThreadPool(2)) {
+            var first = callers.submit(() -> bff("DELETE", "/api/account/me", command, handle));
+            try {
+                assertTrue(target.projectEntered.await(5, TimeUnit.SECONDS));
+                assertEquals(202, bff("DELETE", "/api/account/me", null, handle).statusCode());
+                assertEquals(1, db.queryForObject("SELECT count(*) FROM auth.account_deletion WHERE user_id=?", Integer.class, user));
+            } finally {
+                target.releaseProject.countDown();
+            }
+            assertEquals(204, first.get(5, TimeUnit.SECONDS).statusCode());
+            assertEquals(1, target.projectJobs.size());
+            assertEquals(target.projectJobs, target.interviewJobs);
+            assertEquals(401, bff("DELETE", "/api/account/me", null, handle).statusCode());
+        } finally {
+            DELETION_TARGETS.remove(user);
+        }
     }
 
     @Test void accountStateAndOtherSessionStayIsolated() throws Exception {

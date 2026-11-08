@@ -45,6 +45,13 @@ devfield:
       bff: ${AUTH_BFF_KEY_SHA256}
       project: ${AUTH_PROJECT_KEY_SHA256}
       interview: ${AUTH_INTERVIEW_KEY_SHA256}
+    deletion:
+      project-url: ${AUTH_X03_PROJECT_URL:}
+      project-key: ${AUTH_X03_PROJECT_KEY:}
+      interview-url: ${AUTH_X04_INTERVIEW_URL:}
+      interview-key: ${AUTH_X04_INTERVIEW_KEY:}
+      timeout: ${AUTH_DELETION_TIMEOUT:PT3S}
+      poll-ms: ${AUTH_DELETION_POLL_MS:5000}
     oauth:
       browser-origin: ${AUTH_BROWSER_ORIGIN:http://127.0.0.1:18080}
       web-callback: ${AUTH_WEB_OAUTH_CALLBACK:http://localhost:13000/auth/oauth/callback}
