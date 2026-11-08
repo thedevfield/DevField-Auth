@@ -16,6 +16,7 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 public class OAuthFlowStore {
     public record Intent(UUID id, String provider, String flowId, String bindingHash, String returnRoute, UUID userId, UUID sessionId, String purpose, boolean selectAccount) {}
+    private record AccountHandoff(UUID user, String provider, String providerId, String route) {}
     public record HandoffResult(String sessionHandle, UUID userId, String returnRoute, String reauthProof, String outcome) {}
     private final JdbcTemplate db;
     private final dev.devfield.auth.session.AuthSessions sessions;
@@ -55,6 +56,7 @@ public class OAuthFlowStore {
     public String createIntent(String provider, String bindingHash, String flowId, String returnRoute) {
         return createIntent(provider, bindingHash, flowId, returnRoute, null, null, false);
     }
+    @Transactional
     public HandoffResult exchange(String handoff, String binding, String flowId) {
         return exchange(handoff, binding, flowId, null, "LOGIN");
     }
@@ -85,6 +87,7 @@ public class OAuthFlowStore {
                 (List.of("LOGIN_COMPLETE", "SIGNUP_COMPLETE").contains(returnRoute) != (userId == null && sessionId == null)) ||
                 (userId == null) != (sessionId == null))
             throw new ApiError(HttpStatus.BAD_REQUEST, "invalid_oauth_intent");
+        if (userId == null) OAuthDeletionFence.lock(db);
         // One database lock covers every Auth instance. Never derive a quota key from caller-controlled flow data.
         db.queryForObject("SELECT pg_advisory_xact_lock(190197822, 9)", Object.class);
         Integer recent = db.queryForObject("SELECT count(*) FROM auth.action_token WHERE purpose LIKE 'OAUTH_INTENT_%' " +
@@ -95,8 +98,8 @@ public class OAuthFlowStore {
             throw new ApiError(HttpStatus.TOO_MANY_REQUESTS, "oauth_start_limited");
         String purpose = "OAUTH_INTENT_" + returnRoute.substring(0, returnRoute.indexOf('_'));
         String intent = Secrets.randomToken();
-        db.update("INSERT INTO auth.action_token(id,purpose,token_hash,expires_at,provider,flow_id,browser_binding_hash,return_route,user_id,session_id,select_account) " +
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", UUID.randomUUID(), purpose, Secrets.sha256(intent),
+        db.update("INSERT INTO auth.action_token(id,purpose,token_hash,expires_at,provider,flow_id,browser_binding_hash,return_route,user_id,session_id,select_account,created_at) " +
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, clock_timestamp())", UUID.randomUUID(), purpose, Secrets.sha256(intent),
                 Timestamp.from(Instant.now().plus(intentTtl)), provider, flowId, bindingHash, returnRoute, userId, sessionId, selectAccount);
         return browserOrigin + "/oauth2/authorization/" + provider + "?intent=" + intent;
     }
@@ -118,9 +121,13 @@ public class OAuthFlowStore {
     }
 
     public Intent byState(String state) {
+        return byState(state, false);
+    }
+
+    private Intent byState(String state, boolean lock) {
         if (state == null || state.length() < 32) throw new ApiError(HttpStatus.BAD_REQUEST, "invalid_oauth_state");
         var rows = db.query("SELECT id,provider,flow_id,browser_binding_hash,return_route,user_id,session_id,purpose,select_account FROM auth.action_token " +
-                        "WHERE oauth_state_hash=? AND purpose LIKE 'OAUTH_INTENT_%' AND started_at IS NOT NULL AND expires_at>now() FOR KEY SHARE",
+                        "WHERE oauth_state_hash=? AND purpose LIKE 'OAUTH_INTENT_%' AND started_at IS NOT NULL AND expires_at>clock_timestamp()" + (lock ? " FOR KEY SHARE" : ""),
                 (rs, i) -> new Intent(rs.getObject(1, UUID.class), rs.getString(2), rs.getString(3), rs.getString(4), rs.getString(5), rs.getObject(6, UUID.class), rs.getObject(7, UUID.class), rs.getString(8), rs.getBoolean(9)), Secrets.sha256(state));
         if (rows.isEmpty()) throw new ApiError(HttpStatus.GONE, "oauth_intent_expired_or_used");
         return rows.getFirst();
@@ -147,6 +154,19 @@ public class OAuthFlowStore {
         Intent intent = byState(state);
         if (!intent.provider().equals(provider) || providerId == null || providerId.isBlank() || providerId.length() > 255)
             throw new ApiError(HttpStatus.BAD_REQUEST, "invalid_oauth_callback");
+        if (intent.userId() != null) {
+            sessions.lockUser(intent.userId());
+            sessions.requireActive(sessions.byId(intent.sessionId(), intent.userId()));
+        } else {
+            OAuthDeletionFence.lock(db);
+            db.queryForObject("SELECT pg_advisory_xact_lock(hashtext(?),hashtext(?))", Object.class, provider, providerId);
+            var owners = db.query("SELECT user_id FROM auth.social_identity WHERE provider=? AND provider_user_id=?",
+                    (rs, i) -> rs.getObject(1, UUID.class), provider, providerId);
+            if (!owners.isEmpty() && !"ACTIVE".equals(sessions.lockUser(owners.getFirst())))
+                throw new ApiError(HttpStatus.FORBIDDEN, "account_unavailable");
+            OAuthDeletionFence.rejectOldIntent(db, intent.id(), provider, providerId);
+        }
+        intent = byState(state, true);
         String handoff = Secrets.randomToken();
         db.update("INSERT INTO auth.action_token(id,purpose,token_hash,expires_at,provider,provider_user_id,provider_email," +
                         "flow_id,browser_binding_hash,return_route,parent_intent_id,user_id,session_id) VALUES (?,'WEB_HANDOFF',?,?,?,?,?,?,?,?,?,?,?)",
@@ -160,11 +180,26 @@ public class OAuthFlowStore {
         if (!flowAllowed(handoff) || !flowAllowed(binding) || !flowAllowed(flowId))
             throw new ApiError(HttpStatus.BAD_REQUEST, "invalid_handoff");
         String bindingHash = Secrets.sha256(binding);
+        String handoffHash = Secrets.sha256(handoff);
+        // Account handoffs share the USER-before-token order with final account cleanup.
+        var ownersOfHandoff = db.query("""
+                SELECT user_id,provider,provider_user_id,return_route FROM auth.action_token
+                WHERE token_hash=? AND purpose='WEB_HANDOFF' AND flow_id=? AND browser_binding_hash=?
+                """, (rs, i) -> new AccountHandoff(rs.getObject(1, UUID.class), rs.getString(2), rs.getString(3), rs.getString(4)),
+                handoffHash, flowId, bindingHash);
+        if (!ownersOfHandoff.isEmpty()) {
+            var account = ownersOfHandoff.getFirst();
+            if (account.user() == null) OAuthDeletionFence.lock(db);
+            if ("LINK_COMPLETE".equals(account.route()))
+                db.queryForObject("SELECT pg_advisory_xact_lock(hashtext(?),hashtext(?))", Object.class,
+                        account.provider(), account.providerId());
+            if (account.user() != null) sessions.lockUser(account.user());
+        }
         var rows = db.query("UPDATE auth.action_token SET consumed_at=now() WHERE token_hash=? AND purpose='WEB_HANDOFF' " +
-                        "AND flow_id=? AND browser_binding_hash=? AND consumed_at IS NULL AND expires_at>now() " +
+                        "AND flow_id=? AND browser_binding_hash=? AND consumed_at IS NULL AND expires_at>clock_timestamp() " +
                         "RETURNING provider,provider_user_id,return_route,user_id,session_id",
                 (rs, i) -> new String[]{rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4), rs.getString(5)},
-                Secrets.sha256(handoff), flowId, bindingHash);
+                handoffHash, flowId, bindingHash);
         if (rows.isEmpty()) {
             Integer active = db.queryForObject("SELECT count(*) FROM auth.action_token WHERE token_hash=? " +
                     "AND purpose='WEB_HANDOFF' AND consumed_at IS NULL AND expires_at>now()",
@@ -177,14 +212,11 @@ public class OAuthFlowStore {
             !("SIGNUP".equals(expectedPurpose) && "SIGNUP_COMPLETE".equals(row[2])) &&
             !("ACCOUNT".equals(expectedPurpose) && ("LINK_COMPLETE".equals(row[2]) || "REAUTH_COMPLETE".equals(row[2]))))
             throw new ApiError(HttpStatus.BAD_REQUEST, "invalid_handoff_purpose");
-        if ("LINK_COMPLETE".equals(row[2]))
-            db.queryForObject("SELECT pg_advisory_xact_lock(hashtext(?),hashtext(?))", Object.class, row[0], row[1]);
         if (!List.of("LOGIN_COMPLETE", "SIGNUP_COMPLETE").contains(row[2])) {
             var session = sessions.byHandle(handle);
             sessions.requireActive(session);
             if (!session.userId().toString().equals(row[3]) || !session.id().toString().equals(row[4]))
                 throw new ApiError(HttpStatus.FORBIDDEN, "session_unavailable");
-            db.queryForObject("SELECT state FROM auth.devfield_user WHERE id=? FOR UPDATE", String.class, session.userId());
             sessions.requireActive(sessions.byId(session.id(), session.userId()));
             if ("REAUTH_COMPLETE".equals(row[2])) {
                 Integer match = db.queryForObject("SELECT count(*) FROM auth.social_identity WHERE user_id=? AND provider=? AND provider_user_id=?", Integer.class, session.userId(), row[0], row[1]);
@@ -239,6 +271,7 @@ public class OAuthFlowStore {
         int proofs = db.update("WITH due AS (SELECT id FROM auth.action_token WHERE purpose='ACCOUNT_REAUTH' " +
                 "AND (expires_at<=now() OR consumed_at IS NOT NULL) ORDER BY expires_at,id LIMIT ? FOR UPDATE SKIP LOCKED) " +
                 "DELETE FROM auth.action_token t USING due WHERE t.id=due.id", batchSize);
+        OAuthDeletionFence.cleanup(db, batchSize);
         return handoffs + intents + proofs;
     }
 }

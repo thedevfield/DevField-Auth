@@ -47,4 +47,12 @@ Signup sends mail while its DB transaction is open: an SMTP failure rolls back t
 
 ## Later phases
 
-Phase 2-C: Project/Interview JWKS validation, AUTH-15 fail-closed check, and local resource ownership checks. Password reset, explicit social links, and coordinated account deletion remain outside Phase 2-B.
+Phase 2-C: Project/Interview JWKS validation, AUTH-15 fail-closed check, and local resource ownership checks.
+
+## Account deletion (A-04)
+
+`DELETE /api/account/me` is restricted to the trusted BFF. The BFF validates Web Origin and CSRF, sends the existing session handle, and supplies the one-time `reauthProof` on the first request. While deletion is pending, the response is `202` with `deletionStatus=DELETING`. A request that observes final cleanup returns `204`. Once the session is gone, another request with that handle returns `401`.
+
+Configure the fixed receiver origins with `AUTH_X03_PROJECT_URL` and `AUTH_X04_INTERVIEW_URL`. Supply independent raw keys in `AUTH_X03_PROJECT_KEY` and `AUTH_X04_INTERVIEW_KEY`; each receiver gets only the corresponding SHA-256 digest. Use HTTPS in production. Plain HTTP is limited to loopback development and tests. Without both receivers configured, new requests cannot start deletion.
+
+Auth preserves the same job ID across retries and stores each receiver's `204` before final cleanup. The scheduler resumes pending work without a browser session. Check the logged job ID, service, and status when a receiver repeatedly rejects a command.

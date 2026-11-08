@@ -2,6 +2,7 @@ package dev.devfield.auth.account;
 
 import dev.devfield.auth.api.ApiError;
 import dev.devfield.auth.mail.VerificationMailer;
+import dev.devfield.auth.session.AuthSessions;
 import dev.devfield.auth.util.Secrets;
 import java.sql.Timestamp;
 import java.time.Duration;
@@ -23,6 +24,7 @@ public class AuthAccounts {
     private record Credential(UUID id, UUID userId, String hash, Instant verifiedAt,
                               Instant reservationExpiresAt, Instant latestTokenAt, String state) {}
     private final JdbcTemplate db;
+    private final AuthSessions sessions;
     private final VerificationMailer mailer;
     private final AttemptLimiter limiter;
     private final BCryptPasswordEncoder passwords = new BCryptPasswordEncoder(12);
@@ -30,11 +32,11 @@ public class AuthAccounts {
     private final Duration signupCooldown;
     private final Duration sessionTtl;
 
-    public AuthAccounts(JdbcTemplate db, VerificationMailer mailer, AttemptLimiter limiter,
+    public AuthAccounts(JdbcTemplate db, VerificationMailer mailer, AttemptLimiter limiter, AuthSessions sessions,
                         @Value("${devfield.auth.verification-ttl}") Duration verificationTtl,
                         @Value("${devfield.auth.signup-cooldown}") Duration signupCooldown,
                         @Value("${devfield.auth.session-ttl}") Duration sessionTtl) {
-        this.db = db; this.mailer = mailer; this.limiter = limiter;
+        this.db = db; this.mailer = mailer; this.limiter = limiter; this.sessions = sessions;
         this.verificationTtl = verificationTtl; this.signupCooldown = signupCooldown; this.sessionTtl = sessionTtl;
         if (verificationTtl.isNegative() || verificationTtl.isZero() || signupCooldown.isNegative() ||
                 sessionTtl.isNegative() || sessionTtl.isZero()) throw new IllegalArgumentException("Invalid auth lifetime");
@@ -113,8 +115,11 @@ public class AuthAccounts {
             limiter.fail(limitKey);
             throw new ApiError(HttpStatus.UNAUTHORIZED, "invalid_credentials");
         }
-        if (row.verifiedAt == null || !"ACTIVE".equals(row.state))
+        if (row.verifiedAt == null || !"ACTIVE".equals(sessions.lockUser(row.userId)))
             throw new ApiError(HttpStatus.FORBIDDEN, "account_unavailable");
+        Credential current = credential(normalized);
+        if (current == null || !row.id.equals(current.id) || !row.hash.equals(current.hash))
+            throw new ApiError(HttpStatus.UNAUTHORIZED, "invalid_credentials");
         limiter.clear(limitKey);
         String handle = Secrets.randomToken();
         db.update("INSERT INTO auth.auth_session(id,user_id,session_handle_hash,expires_at) VALUES (?,?,?,?)",

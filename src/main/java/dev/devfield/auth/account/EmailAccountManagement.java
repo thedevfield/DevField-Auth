@@ -144,8 +144,11 @@ public class EmailAccountManagement {
         String key = "password-reset:" + Secrets.sha256(normalized);
         limiter.check(key);
         limiter.fail(key);
+        EmailRow candidate = email(normalized, false);
+        if (candidate == null || !candidate.verified() || candidate.hash() == null
+                || !"ACTIVE".equals(sessions.lockUser(candidate.userId()))) return;
         EmailRow row = email(normalized, true);
-        if (row == null || !row.verified() || row.hash() == null) return;
+        if (row == null || !candidate.id().equals(row.id()) || !row.verified() || row.hash() == null) return;
         Timestamp latestReset = db.queryForObject("SELECT max(created_at) FROM auth.action_token WHERE email_credential_id=? AND purpose='PASSWORD_RESET'", Timestamp.class, row.id());
         if (latestReset != null && latestReset.toInstant().plus(cooldown).isAfter(Instant.now())) return;
         db.update("DELETE FROM auth.action_token WHERE email_credential_id=? AND purpose='PASSWORD_RESET'", row.id());
